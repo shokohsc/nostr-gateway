@@ -607,6 +607,25 @@ func TestProtocolVersionRejected(t *testing.T) {
 	}
 }
 
+// The backoff has to ratchet while a peer keeps failing and start over once a
+// connection outlived the queued wait, or a few restarts in a day pin an agent
+// at the 5 minute ceiling forever.
+func TestReconnectBackoffRatchetsThenResets(t *testing.T) {
+	for _, c := range []struct {
+		prev, connected, want time.Duration
+		why                   string
+	}{
+		{reconnectBase, 0, 2 * reconnectBase, "connect refused"},
+		{4 * reconnectBase, reconnectBase, 8 * reconnectBase, "stream died instantly"},
+		{reconnectMax, time.Minute, reconnectMax, "capped, still flapping"},
+		{reconnectMax, 2 * reconnectMax, reconnectBase, "healthy stream ended"},
+	} {
+		if got := reconnectDelay(c.prev, c.connected); got != c.want {
+			t.Errorf("%s: delay %s, want %s", c.why, got, c.want)
+		}
+	}
+}
+
 func TestOversizedRequestBodyRejected(t *testing.T) {
 	f := newFakeOC(t)
 	_, srv := testHub(t, testRegistry(t, f.URL))

@@ -90,8 +90,9 @@ func (n *nostrTransport) listen(ctx context.Context, a *Agent) {
 		// because relay clocks differ; a durable cursor is the upgrade.
 		Since: ptr(nostr.Now() - 5),
 	}
-	interval := 2 * time.Second
+	interval := reconnectBase
 	for ctx.Err() == nil {
+		connected := time.Now()
 		for ie := range n.pool.SubscribeMany(ctx, n.relays, filter) {
 			if ie.Event == nil {
 				continue
@@ -103,13 +104,13 @@ func (n *nostrTransport) listen(ctx context.Context, a *Agent) {
 		if ctx.Err() != nil {
 			return
 		}
+		interval = reconnectDelay(interval, time.Since(connected))
 		n.log.Warn("nostr subscription ended, resubscribing", "agent", a.Name, "in", interval)
 		select {
 		case <-time.After(interval):
 		case <-ctx.Done():
 			return
 		}
-		interval = min(interval*2, 5*time.Minute)
 	}
 }
 

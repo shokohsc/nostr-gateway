@@ -41,6 +41,23 @@ func newHub(reg *Registry, log *slog.Logger) *hub {
 	return h
 }
 
+// Reconnect policy, shared by the OpenCode stream and the Nostr subscription:
+// start at reconnectBase, double while the peer keeps failing, and start over
+// as soon as a connection outlived the wait we had queued up. Without the reset
+// a few restarts in a day pin an agent at the ceiling for the rest of the
+// process's life, deaf for 5 minutes per drop even after healthy days.
+const (
+	reconnectBase = 2 * time.Second
+	reconnectMax  = 5 * time.Minute
+)
+
+func reconnectDelay(prev, connectedFor time.Duration) time.Duration {
+	if connectedFor > prev {
+		return reconnectBase
+	}
+	return min(prev*2, reconnectMax)
+}
+
 // run consumes each agent's OpenCode event stream, forever, reconnecting when
 // the server restarts.
 func (h *hub) run(ctx context.Context) {
@@ -50,8 +67,9 @@ func (h *hub) run(ctx context.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			interval := 2 * time.Second
+			interval := reconnectBase
 			for ctx.Err() == nil {
+				connected := time.Now()
 				ch, errs, err := h.clients[a.Name].events(ctx)
 				switch {
 				case err != nil:
@@ -65,12 +83,12 @@ func (h *hub) run(ctx context.Context) {
 						h.log.Warn("opencode stream closed", "agent", a.Name, "err", err)
 					default:
 					}
-					h.log.Warn("opencode stream ended, reconnecting", "agent", a.Name, "in", interval)
-					interval = min(interval*2, 5*time.Minute)
 				}
 				if ctx.Err() != nil {
 					return
 				}
+				interval = reconnectDelay(interval, time.Since(connected))
+				h.log.Warn("opencode reconnecting", "agent", a.Name, "in", interval)
 				select {
 				case <-time.After(interval):
 				case <-ctx.Done():
