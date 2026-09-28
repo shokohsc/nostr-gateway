@@ -1,0 +1,160 @@
+# Nostr gateway for KubeOpenCode agents — one central deployment.
+#
+# Plan: docs/plan.md §3-§5. The gateway is a separate Deployment because the
+# KubeOpenCode Agent CRD has no documented sidecar field (plan option B), and
+# one gateway can serve every agent in the namespace.
+#
+#   kubectl apply -f deploy/k8s.yaml
+#
+# The OpenCode servers (:4096) are never exposed outside the cluster; only the
+# gateway's :8080 has a Service, and only for the plain-HTTP API.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubeopencode
+---
+# Agent identities. Nostr private keys live here and are injected as env vars;
+# they never appear in the Agent CRD, the ConfigMap or an image.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nostr-identities
+  namespace: kubeopencode
+type: Opaque
+stringData:
+  FRONTEND_NSEC: "nsec1replace-me-with-a-real-agent-key"
+  GATEWAY_TOKEN: "replace-me"
+---
+# The gateway's view of the cluster: agent name -> OpenCode service + Nostr key.
+# `allow` is a list of hex pubkeys; empty means anyone may talk to the agent.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+  namespace: kubeopencode
+data:
+  agents.json: |
+    {
+      "frontend-agent": {
+        "opencode": "http://frontend-agent.kubeopencode.svc.cluster.local:4096",
+        "npub": "npub1replace-me",
+        "nsec_env": "FRONTEND_NSEC",
+        "allow": [],
+        "model": "anthropic/claude-sonnet-4-5",
+        "opencode_agent": "build"
+      }
+    }
+  relays: "wss://nos.lol,wss://relay.damus.io"
+---
+# The agent itself. Fields follow plan.md §10; check them against the
+# KubeOpenCode CRD version you actually run.
+apiVersion: kubeopencode.dev/v1alpha1
+kind: Agent
+metadata:
+  name: frontend-agent
+  namespace: kubeopencode
+spec:
+  description: "Frontend agent reachable over Nostr"
+  model: "anthropic/claude-sonnet-4-5"
+  agent: "build"
+  environment: |
+    PROJECT_ID=frontend
+  workspace:
+    mountPath: /workspace
+    git: "https://github.com/example/frontend.git"
+---
+# Cluster-internal handle on the agent's OpenCode server.
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-agent
+  namespace: kubeopencode
+spec:
+  selector:
+    app: frontend-agent
+  ports:
+    - name: http
+      port: 4096
+      targetPort: 4096
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nostr-gateway
+  namespace: kubeopencode
+  labels:
+    app: nostr-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nostr-gateway
+  template:
+    metadata:
+      labels:
+        app: nostr-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: ghcr.io/example/nostr-gateway:latest
+          args: []
+          env:
+            - name: AGENTS_FILE
+              value: /etc/gateway/agents.json
+            - name: NOSTR_RELAYS
+              valueFrom:
+                configMapKeyRef:
+                  name: gateway-config
+                  key: relays
+            - name: GATEWAY_ADDR
+              value: ":8080"
+            - name: GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: nostr-identities
+                  key: GATEWAY_TOKEN
+            - name: FRONTEND_NSEC
+              valueFrom:
+                secretKeyRef:
+                  name: nostr-identities
+                  key: FRONTEND_NSEC
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/gateway
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: gateway-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nostr-gateway
+  namespace: kubeopencode
+spec:
+  selector:
+    app: nostr-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

@@ -1,0 +1,642 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip19"
+)
+
+// ---------- fake OpenCode server ----------
+
+type fakeOC struct {
+	*httptest.Server
+	// v2Permissions makes the pre-1.1.1 permission endpoint 404, like a current
+	// OpenCode build.
+	v2Permissions bool
+	mu            sync.Mutex
+	sessions      []string // session titles requested
+	prompts       []map[string]any
+	perms         []string // "<sessionID>/<permissionID>"
+
+	events chan string // pre-marshalled SSE payloads
+}
+
+func newFakeOC(t *testing.T) *fakeOC {
+	t.Helper()
+	f := &fakeOC{events: make(chan string, 64)}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /session", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Title string `json:"title"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.mu.Lock()
+		f.sessions = append(f.sessions, body.Title)
+		id := fmt.Sprintf("ses_%d", len(f.sessions))
+		f.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]string{"id": id})
+	})
+	mux.HandleFunc("POST /session/{id}/prompt_async", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.mu.Lock()
+		f.prompts = append(f.prompts, body)
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
+	record := func(key, response string) {
+		f.mu.Lock()
+		f.perms = append(f.perms, key+":"+response)
+		f.mu.Unlock()
+	}
+	mux.HandleFunc("POST /session/{id}/permissions/{pid}", func(w http.ResponseWriter, r *http.Request) {
+		if f.v2Permissions {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		record(r.PathValue("id")+"/"+r.PathValue("pid"), fmt.Sprint(body["response"]))
+	})
+	mux.HandleFunc("POST /session/{id}/permission/{pid}/reply", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		record(r.PathValue("id")+"/"+r.PathValue("pid")+"/reply", fmt.Sprint(body["reply"]))
+	})
+	mux.HandleFunc("GET /global/event", func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case ev := <-f.events:
+				fmt.Fprintf(w, "data: {\"directory\":\"/tmp\",\"payload\":%s}\n\n", ev)
+				flusher.Flush()
+			}
+		}
+	})
+	f.Server = httptest.NewServer(mux)
+	t.Cleanup(f.Close)
+	return f
+}
+
+func (f *fakeOC) push(typ string, props map[string]any) {
+	b, _ := json.Marshal(map[string]any{"type": typ, "properties": props})
+	f.events <- string(b)
+}
+
+func (f *fakeOC) counts() (sessions, prompts, perms int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sessions), len(f.prompts), len(f.perms)
+}
+
+// ---------- harness ----------
+
+func testRegistry(t *testing.T, ocURL string) *Registry {
+	t.Helper()
+	a := &Agent{Name: "frontend-agent", OpenCode: ocURL, PubKey: strings.Repeat("ab", 32), ck: map[string][32]byte{}}
+	return &Registry{byName: map[string]*Agent{a.Name: a}}
+}
+
+func testHub(t *testing.T, reg *Registry) (*hub, *httptest.Server) {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	go h.run(ctx)
+	t.Cleanup(cancel)
+	return h, httptest.NewServer(h.handler("")) // auth is covered by TestHTTPAuthToken
+}
+
+func post(t *testing.T, url, body string) (int, Envelope) {
+	t.Helper()
+	resp, err := http.Post(url, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var env Envelope
+	_ = json.NewDecoder(resp.Body).Decode(&env)
+	return resp.StatusCode, env
+}
+
+// next reads one event or fails, printing what did arrive.
+func next(t *testing.T, ch <-chan Envelope) Envelope {
+	t.Helper()
+	select {
+	case e := <-ch:
+		return e
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for event")
+		return Envelope{}
+	}
+}
+
+func want(t *testing.T, got Envelope, typ, text string) {
+	t.Helper()
+	if got.Type != typ || (text != "" && got.Payload.Text != text) {
+		t.Fatalf("got %s/%q, want %s/%q", got.Type, got.Payload.Text, typ, text)
+	}
+	if got.V != protocolVersion || got.ID == "" || got.Conversation == "" || got.Agent != "frontend-agent" {
+		t.Fatalf("envelope not stamped: %+v", got)
+	}
+}
+
+// ---------- tests ----------
+
+func TestPromptFlowOverHTTP(t *testing.T) {
+	f := newFakeOC(t)
+	h, srv := testHub(t, testRegistry(t, f.URL))
+
+	sub, cancelSub := h.subscribe("conv-1")
+	defer cancelSub()
+
+	code, ack := post(t, srv.URL+"/v1/messages",
+		`{"conversation":"conv-1","agent":"frontend-agent","type":"message","payload":{"text":"do the thing"}}`)
+	if code != http.StatusAccepted {
+		t.Fatalf("status %d", code)
+	}
+	want(t, ack, TypeAck, "queued")
+	want(t, next(t, sub), TypeAck, "queued") // every outbound event fans out, ack included
+
+	f.push("message.part.updated", map[string]any{
+		"part":  map[string]any{"id": "prt_1", "type": "text", "text": "Sure, ", "sessionID": "ses_1"},
+		"delta": "Sure, ",
+	})
+	want(t, next(t, sub), TypeMessage, "Sure, ")
+
+	f.push("message.part.updated", map[string]any{
+		"part":  map[string]any{"id": "prt_1", "type": "text", "text": "Sure, on it", "sessionID": "ses_1"},
+		"delta": "on it",
+	})
+	want(t, next(t, sub), TypeMessage, "on it")
+
+	f.push("message.part.updated", map[string]any{
+		"part": map[string]any{"id": "prt_2", "type": "tool", "callID": "call_1", "tool": "bash", "sessionID": "ses_1",
+			"state": map[string]any{"status": "completed", "title": "ls", "output": "plan.md"}},
+	})
+	tool := next(t, sub)
+	want(t, tool, TypeToolFinished, "")
+	if tool.Payload.Tool != "bash" || tool.Payload.Output != "plan.md" || tool.Payload.CallID != "call_1" {
+		t.Fatalf("tool payload: %+v", tool.Payload)
+	}
+
+	f.push("session.idle", map[string]any{"sessionID": "ses_1"})
+	want(t, next(t, sub), TypeCompleted, "")
+
+	sessions, prompts, _ := f.counts()
+	if sessions != 1 || prompts != 1 {
+		t.Fatalf("sessions=%d prompts=%d, want 1/1", sessions, prompts)
+	}
+	if got := f.prompts[0]["parts"].([]any)[0].(map[string]any)["text"]; got != "do the thing" {
+		t.Fatalf("prompt text %v", got)
+	}
+}
+
+func TestPermissionApprovalLoop(t *testing.T) {
+	f := newFakeOC(t)
+	h, srv := testHub(t, testRegistry(t, f.URL))
+	sub, cancelSub := h.subscribe("conv-2")
+	defer cancelSub()
+
+	post(t, srv.URL+"/v1/messages", `{"conversation":"conv-2","agent":"frontend-agent","type":"message","payload":{"text":"delete it"}}`)
+	want(t, next(t, sub), TypeAck, "queued")
+
+	f.push("permission.updated", map[string]any{
+		"id": "per_1", "sessionID": "ses_1", "type": "bash", "title": "rm -rf build",
+	})
+	req := next(t, sub)
+	want(t, req, TypePermissionReq, "")
+	if req.Payload.PermissionID != "per_1" || req.Payload.Title != "rm -rf build" {
+		t.Fatalf("permission payload: %+v", req.Payload)
+	}
+
+	code, prog := post(t, srv.URL+"/v1/messages",
+		`{"conversation":"conv-2","agent":"frontend-agent","type":"permission_response","payload":{"permission_id":"per_1","text":"once"}}`)
+	if code != http.StatusAccepted {
+		t.Fatalf("status %d", code)
+	}
+	want(t, prog, TypeProgress, "once")
+	want(t, next(t, sub), TypeProgress, "once")
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.perms) != 1 || f.perms[0] != "ses_1/per_1:once" {
+		t.Fatalf("permissions: %v", f.perms)
+	}
+}
+
+func TestSessionReusedAcrossMessages(t *testing.T) {
+	f := newFakeOC(t)
+	h, _ := testHub(t, testRegistry(t, f.URL))
+	ctx := context.Background()
+
+	for _, text := range []string{"first", "second"} {
+		ack, err := h.Handle(ctx, h.reg.byName["frontend-agent"], Envelope{
+			Conversation: "conv-3", Agent: "frontend-agent", Type: TypeMessage, Payload: Payload{Text: text},
+		}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ack.Conversation != "conv-3" {
+			t.Fatalf("conversation %q", ack.Conversation)
+		}
+	}
+	if s, p, _ := f.counts(); s != 1 || p != 2 {
+		t.Fatalf("sessions=%d prompts=%d, want 1/2", s, p)
+	}
+}
+
+func TestUnknownAgentAndEmptyTextRejected(t *testing.T) {
+	f := newFakeOC(t)
+	_, srv := testHub(t, testRegistry(t, f.URL))
+	if code, _ := post(t, srv.URL+"/v1/messages", `{"agent":"nope","type":"message","payload":{"text":"x"}}`); code != http.StatusBadRequest {
+		t.Fatalf("unknown agent status %d", code)
+	}
+	if code, _ := post(t, srv.URL+"/v1/messages", `{"agent":"frontend-agent","type":"message","payload":{"text":""}}`); code != http.StatusBadRequest {
+		t.Fatalf("empty text status %d", code)
+	}
+	if code, _ := post(t, srv.URL+"/v1/messages", `{"agent":"frontend-agent","type":"question","payload":{"text":"x"}}`); code != http.StatusBadRequest {
+		t.Fatalf("bad type status %d", code)
+	}
+}
+
+func TestHTTPAuthToken(t *testing.T) {
+	f := newFakeOC(t)
+	h := newHub(testRegistry(t, f.URL), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := httptest.NewServer(h.handler("secret"))
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"agent":"frontend-agent","type":"message","payload":{"text":"hi"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status %d", resp.StatusCode)
+	}
+}
+
+// The allow list is a Nostr-identity gate. An HTTP caller carries no Nostr
+// identity and cannot become one by asserting a sender, so the conversation
+// must not gain a Nostr peer (see TestNostrAllowList and the exfiltration test
+// in nostr_test.go for the Nostr side).
+func TestHTTPHandleHasNoNostrIdentity(t *testing.T) {
+	f := newFakeOC(t)
+	reg := testRegistry(t, f.URL)
+	reg.byName["frontend-agent"].Allow = []string{strings.Repeat("cd", 32)}
+	h, srv := testHub(t, reg)
+
+	code, ack := post(t, srv.URL+"/v1/messages",
+		`{"conversation":"c2","agent":"frontend-agent","sender":"`+strings.Repeat("cd", 32)+`","type":"message","payload":{"text":"hi"}}`)
+	if code != http.StatusAccepted {
+		t.Fatalf("status %d: an authenticated HTTP caller is not a Nostr sender", code)
+	}
+	if ack.Conversation != "c2" {
+		t.Fatalf("conversation %q", ack.Conversation)
+	}
+	if p := h.convs.get("c2").peerPub(); p != "" {
+		t.Fatalf("conversation picked up nostr peer %s from a self-declared sender", p)
+	}
+}
+
+func TestLoadRegistry(t *testing.T) {
+	sk := nostr.GeneratePrivateKey()
+	pk, err := nostr.GetPublicKey(sk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agents.json")
+	npub, err := nip19.EncodePublicKey(pk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Config is written the way operators write it: bech32. Everything
+	// downstream speaks hex, so the registry must normalise it — a p-tag filter
+	// built from bech32 never matches a real relay's hex p tag.
+	cfg := fmt.Sprintf(`{"agent-a":{"opencode":"http://oc:4096","npub":%q,"nsec_env":"AGENT_A_NSEC","allow":[],"model":"anthropic/claude-sonnet-4"}}`, npub)
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENTS_FILE", path)
+	t.Setenv("AGENT_A_NSEC", sk) // as mounted from a Kubernetes Secret
+
+	reg, err := loadRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := reg.byName["agent-a"]
+	if a == nil || a.PubKey != pk || a.sk != sk || a.Model != "anthropic/claude-sonnet-4" {
+		t.Fatalf("registry: %+v", a)
+	}
+	if !a.allows("") {
+		t.Fatal("empty allow list should accept anyone")
+	}
+	t.Setenv("AGENTS_FILE", "") // fall back to the inline config
+	t.Setenv("AGENTS", `{"agent-b":{"opencode":"http://x:4096","npub":"garbage"}}`)
+	if _, err := loadRegistry(); err == nil {
+		t.Fatal("a malformed npub must be rejected, not silently deaf")
+	}
+}
+
+func TestReduceEvent(t *testing.T) {
+	seen := map[string]bool{}
+	tests := []struct {
+		name  string
+		ev    map[string]any
+		want  []reduced
+		after []string // extra calls expected to produce nothing
+	}{
+		{
+			name: "text delta streams",
+			ev:   map[string]any{"type": "message.part.updated", "properties": map[string]any{"delta": "he", "part": map[string]any{"id": "p1", "type": "text"}}},
+			want: []reduced{{Type: TypeMessage, Payload: Payload{Text: "he"}}},
+		},
+		{
+			name:  "full text deduplicated by part id",
+			ev:    map[string]any{"type": "message.part.updated", "properties": map[string]any{"part": map[string]any{"id": "p2", "type": "text", "text": "hello"}}},
+			want:  []reduced{{Type: TypeMessage, Payload: Payload{Text: "hello"}}},
+			after: []string{"message.part.updated"},
+		},
+		{
+			name: "reasoning is thinking",
+			ev:   map[string]any{"type": "message.part.updated", "properties": map[string]any{"delta": "hmm", "part": map[string]any{"id": "p3", "type": "reasoning"}}},
+			want: []reduced{{Type: TypeThinking, Payload: Payload{Text: "hmm"}}},
+		},
+		{
+			name: "pending tool is silent",
+			ev:   map[string]any{"type": "message.part.updated", "properties": map[string]any{"part": map[string]any{"id": "p4", "type": "tool", "callID": "c1", "state": map[string]any{"status": "pending"}}}},
+			want: nil,
+		},
+		{
+			name: "running tool starts",
+			ev:   map[string]any{"type": "message.part.updated", "properties": map[string]any{"part": map[string]any{"id": "p5", "type": "tool", "callID": "c2", "tool": "edit", "state": map[string]any{"status": "running", "title": "Edit file"}}}},
+			want: []reduced{{Type: TypeToolStarted, Payload: Payload{Tool: "edit", CallID: "c2", Title: "Edit file"}}},
+		},
+		{
+			name: "tool error finishes with error",
+			ev:   map[string]any{"type": "message.part.updated", "properties": map[string]any{"part": map[string]any{"id": "p6", "type": "tool", "callID": "c3", "tool": "bash", "state": map[string]any{"status": "error", "error": "exit 1"}}}},
+			want: []reduced{{Type: TypeToolFinished, Payload: Payload{Tool: "bash", CallID: "c3", Error: "exit 1"}}},
+		},
+		{
+			name: "step markers ignored",
+			ev:   map[string]any{"type": "message.part.updated", "properties": map[string]any{"part": map[string]any{"id": "p7", "type": "step-start"}}},
+			want: nil,
+		},
+		{
+			name: "idle completes",
+			ev:   map[string]any{"type": "session.idle", "properties": map[string]any{"sessionID": "s"}},
+			want: []reduced{{Type: TypeCompleted}},
+		},
+		{
+			name: "session error",
+			ev:   map[string]any{"type": "session.error", "properties": map[string]any{"sessionID": "s", "error": map[string]any{"name": "ProviderError", "data": map[string]any{"message": "429"}}}},
+			want: []reduced{{Type: TypeError, Payload: Payload{Error: "429", Text: "429"}}},
+		},
+		{
+			name: "idle via session.status",
+			ev:   map[string]any{"type": "session.status", "properties": map[string]any{"sessionID": "s", "status": "idle"}},
+			want: []reduced{{Type: TypeCompleted}},
+		},
+		{
+			name: "busy status is not completion",
+			ev:   map[string]any{"type": "session.status", "properties": map[string]any{"sessionID": "s", "status": "busy"}},
+			want: nil,
+		},
+		{
+			name: "permission.asked with requestID",
+			ev:   map[string]any{"type": "permission.asked", "properties": map[string]any{"id": "req_1", "requestID": "req_1", "sessionID": "s", "title": "run tests"}},
+			want: []reduced{{Type: TypePermissionReq, Payload: Payload{PermissionID: "req_1", Title: "run tests", Text: "run tests"}}},
+		},
+		{
+			name: "permission.replied with reply",
+			ev:   map[string]any{"type": "permission.replied", "properties": map[string]any{"sessionID": "s", "requestID": "req_1", "reply": "always"}},
+			want: []reduced{{Type: TypeProgress, Payload: Payload{PermissionID: "req_1", Text: "permission req_1: always"}}},
+		},
+		{
+			name: "unknown event ignored",
+			ev:   map[string]any{"type": "file.edited", "properties": map[string]any{"file": "a.go"}},
+			want: nil,
+		},
+	}
+	for _, tc := range tests {
+		raw, _ := json.Marshal(tc.ev)
+		var oe opencodeEvent
+		_ = json.Unmarshal(raw, &oe)
+		got := reduceEvent(oe, seen)
+		if len(got) != len(tc.want) {
+			t.Fatalf("%s: got %+v, want %+v", tc.name, got, tc.want)
+		}
+		for i := range got {
+			if got[i].Type != tc.want[i].Type || got[i].Payload != tc.want[i].Payload {
+				t.Fatalf("%s: got %+v, want %+v", tc.name, got[i], tc.want[i])
+			}
+		}
+		for _, typ := range tc.after {
+			ae := oe
+			ae.Type = typ
+			if extra := reduceEvent(ae, seen); len(extra) != 0 {
+				t.Fatalf("%s: replay produced %+v", tc.name, extra)
+			}
+		}
+	}
+}
+
+// Two simultaneous first messages must share one session. The regression: a
+// check-then-create outside the lock produced two sessions, and the events of
+// the unbound one were dropped forever.
+func TestConcurrentFirstMessageCreatesOneSession(t *testing.T) {
+	f := newFakeOC(t)
+	h, _ := testHub(t, testRegistry(t, f.URL))
+	agent := h.reg.byName["frontend-agent"]
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := h.Handle(context.Background(), agent, Envelope{
+				Conversation: "conv-race", Agent: agent.Name, Type: TypeMessage,
+				Payload: Payload{Text: fmt.Sprintf("message %d", i)},
+			}, "")
+			if err != nil {
+				t.Error(err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	sessions, prompts, _ := f.counts()
+	if sessions != 1 {
+		t.Fatalf("created %d sessions for one conversation, want 1", sessions)
+	}
+	if prompts != 4 {
+		t.Fatalf("prompts = %d, want 4", prompts)
+	}
+	// Every prompt must address the session that is actually bound, or its
+	// events land nowhere.
+	bound := h.convs.get("conv-race").sessionID()
+	if h.convs.byOpenCodeSession(agent.Name, bound) == nil {
+		t.Fatalf("session %s is not bound to the conversation", bound)
+	}
+}
+
+func TestConversationBelongsToOneAgent(t *testing.T) {
+	f := newFakeOC(t)
+	reg := testRegistry(t, f.URL)
+	reg.byName["backend-agent"] = &Agent{Name: "backend-agent", OpenCode: f.URL, PubKey: strings.Repeat("cd", 32), ck: map[string][32]byte{}}
+	h, srv := testHub(t, reg)
+
+	if code, _ := post(t, srv.URL+"/v1/messages", `{"conversation":"shared","agent":"frontend-agent","type":"message","payload":{"text":"hi"}}`); code != http.StatusAccepted {
+		t.Fatalf("first agent status %d", code)
+	}
+	code, _ := post(t, srv.URL+"/v1/messages", `{"conversation":"shared","agent":"backend-agent","type":"message","payload":{"text":"hi again"}}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("cross-agent conversation status %d, want 400", code)
+	}
+	if s, p, _ := f.counts(); s != 1 || p != 1 {
+		t.Fatalf("sessions=%d prompts=%d, want 1/1", s, p)
+	}
+	// A rejected request must not re-point the live conversation's replies.
+	if c := h.convs.get("shared"); c == nil || c.peerPub() != "" {
+		t.Fatalf("rejected cross-agent request changed the reply peer to %q", c.peerPub())
+	}
+}
+
+func TestPermissionV2Server(t *testing.T) {
+	f := newFakeOC(t)
+	f.v2Permissions = true
+	h, srv := testHub(t, testRegistry(t, f.URL))
+	sub, cancelSub := h.subscribe("conv-v2")
+	defer cancelSub()
+
+	post(t, srv.URL+"/v1/messages", `{"conversation":"conv-v2","agent":"frontend-agent","type":"message","payload":{"text":"go"}}`)
+	want(t, next(t, sub), TypeAck, "queued")
+
+	// A current OpenCode names the event permission.asked with requestID.
+	f.push("permission.asked", map[string]any{
+		"id": "per_2", "requestID": "req_2", "sessionID": "ses_1", "title": "write /etc/hosts",
+	})
+	req := next(t, sub)
+	want(t, req, TypePermissionReq, "")
+	if req.Payload.PermissionID != "req_2" {
+		t.Fatalf("permission id %q, want requestID req_2", req.Payload.PermissionID)
+	}
+
+	if code, _ := post(t, srv.URL+"/v1/messages",
+		`{"conversation":"conv-v2","agent":"frontend-agent","type":"permission_response","payload":{"permission_id":"req_2","text":"always"}}`); code != http.StatusAccepted {
+		t.Fatalf("permission_response status %d", code)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.perms) != 1 || f.perms[0] != "ses_1/req_2/reply:always" {
+		t.Fatalf("permission reply did not fall back to the v2 endpoint: %v", f.perms)
+	}
+}
+
+// An event bigger than the old 8MB scanner buffer must not tear down the
+// agent's whole stream.
+func TestOversizedEventSurvives(t *testing.T) {
+	f := newFakeOC(t)
+	h, srv := testHub(t, testRegistry(t, f.URL))
+	sub, cancelSub := h.subscribe("conv-big")
+	defer cancelSub()
+
+	post(t, srv.URL+"/v1/messages", `{"conversation":"conv-big","agent":"frontend-agent","type":"message","payload":{"text":"go"}}`)
+	want(t, next(t, sub), TypeAck, "queued")
+
+	huge := strings.Repeat("x", 9<<20)
+	f.push("message.part.updated", map[string]any{
+		"part": map[string]any{"id": "big", "type": "text", "text": huge, "sessionID": "ses_1"},
+	})
+	f.push("session.idle", map[string]any{"sessionID": "ses_1"})
+
+	if got := next(t, sub); got.Payload.Text != huge {
+		t.Fatalf("oversized event lost: got %d bytes, want %d", len(got.Payload.Text), len(huge))
+	}
+	want(t, next(t, sub), TypeCompleted, "") // the stream survived
+}
+
+func TestSubscribeReplaysHistory(t *testing.T) {
+	f := newFakeOC(t)
+	h, srv := testHub(t, testRegistry(t, f.URL))
+
+	// The documented flow posts first and opens the stream afterwards.
+	code, ack := post(t, srv.URL+"/v1/messages", `{"conversation":"conv-late","agent":"frontend-agent","type":"message","payload":{"text":"go"}}`)
+	if code != http.StatusAccepted {
+		t.Fatalf("status %d", code)
+	}
+	f.push("message.part.updated", map[string]any{
+		"delta": "the answer", "part": map[string]any{"id": "p1", "type": "text", "sessionID": "ses_1"},
+	})
+
+	sub, cancelSub := h.subscribe(ack.Conversation)
+	defer cancelSub()
+	want(t, next(t, sub), TypeAck, "queued")
+	want(t, next(t, sub), TypeMessage, "the answer")
+}
+
+func TestProtocolVersionRejected(t *testing.T) {
+	f := newFakeOC(t)
+	_, srv := testHub(t, testRegistry(t, f.URL))
+	if code, _ := post(t, srv.URL+"/v1/messages",
+		`{"v":99,"agent":"frontend-agent","type":"message","payload":{"text":"hi"}}`); code != http.StatusBadRequest {
+		t.Fatalf("future protocol version status %d, want 400", code)
+	}
+	if s, _, _ := f.counts(); s != 0 {
+		t.Fatalf("future version created %d sessions", s)
+	}
+}
+
+func TestOversizedRequestBodyRejected(t *testing.T) {
+	f := newFakeOC(t)
+	_, srv := testHub(t, testRegistry(t, f.URL))
+	big := strings.Repeat("y", 2<<20)
+	code, _ := post(t, srv.URL+"/v1/messages",
+		`{"agent":"frontend-agent","type":"message","payload":{"text":"`+big+`"}}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("2MB body status %d, want 400", code)
+	}
+}
+
+// A part that streamed deltas must not also emit the final full-text snapshot:
+// the client would see the whole message twice.
+func TestDeltaThenSnapshotDoesNotDouble(t *testing.T) {
+	seen := map[string]bool{}
+	first := opencodeEvent{Type: "message.part.updated", Properties: json.RawMessage(
+		`{"delta":"Hel","part":{"id":"p1","type":"text","text":"Hello"}}`)}
+	second := opencodeEvent{Type: "message.part.updated", Properties: json.RawMessage(
+		`{"delta":"lo","part":{"id":"p1","type":"text","text":"Hello"}}`)}
+	snapshot := opencodeEvent{Type: "message.part.updated", Properties: json.RawMessage(
+		`{"part":{"id":"p1","type":"text","text":"Hello"}}`)}
+
+	for _, want := range []string{"Hel", "lo"} {
+		got := reduceEvent(first, seen)
+		if len(got) != 1 || got[0].Payload.Text != want {
+			t.Fatalf("delta %q: got %+v", want, got)
+		}
+		first, second = second, first
+	}
+	if got := reduceEvent(snapshot, seen); len(got) != 0 {
+		t.Fatalf("snapshot after deltas emitted %+v", got)
+	}
+}
