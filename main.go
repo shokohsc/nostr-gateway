@@ -28,7 +28,10 @@ func main() {
 	token := os.Getenv("GATEWAY_TOKEN")
 	relays := splitCSV(envOr("NOSTR_RELAYS", defaultRelays))
 	log.Info("nostr relays", "relays", strings.Join(relays, ","))
-	nt := newNostrTransport(ctx, relays, reg, h, log)
+	nt := newNostrTransport(ctx, relays, splitCSV(os.Getenv("BUZZ_RELAYS")), reg, h, log)
+	if len(nt.buzzRelays) > 0 {
+		log.Info("buzz relays (subscribed to, never published to)", "relays", strings.Join(nt.buzzRelays, ","))
+	}
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)

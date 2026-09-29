@@ -89,6 +89,7 @@ the same.
 | `AGENTS_FILE` | — | Path to the agent registry (required) |
 | `AGENTS` | — | Same JSON inline, used when `AGENTS_FILE` is unset |
 | `NOSTR_RELAYS` | `wss://nos.lol,wss://relay.damus.io` | Comma-separated relay URLs |
+| `BUZZ_RELAYS` | unset | Comma-separated Buzz relay URLs. Set it and each agent also listens to the Buzz channels it is a member of; nothing is ever published there |
 | `GATEWAY_ADDR` | `:8080` | HTTP listen address |
 | `GATEWAY_TOKEN` | unset | Bearer token for the HTTP API; unset disables auth |
 | `OPENCODE_USER` / `OPENCODE_PASSWORD` | unset | Basic auth for OpenCode servers that require it |
@@ -106,6 +107,37 @@ subscription is closed with `auth-required: verification failed`.
 Each agent holds its own pool and therefore its own connection, because a
 closed relay accepts only events signed by the key that authenticated that
 connection.
+
+### Buzz channels
+
+[Buzz](https://github.com/block/buzz) is a Nostr workspace that speaks NIP-29, so
+its chats are not kind `30078` envelopes: a message is a kind `9` event tagged
+`#h <channel-uuid>`, an @mention is that message with a `p` tag for the agent's
+`npub`, and a DM is just a channel the agent shares with one other person. Set
+`BUZZ_RELAYS` and the gateway joins in:
+
+```bash
+export BUZZ_RELAYS='ws://buzz.example.internal:3000'
+```
+
+- A relay only hands channel-scoped events to a subscription that names the
+  channel, so the agent's channels are discovered first, from the NIP-29 member
+  lists (kind `39002`) the agent's own pubkey appears in. Membership is re-read
+  every minute, so a channel the agent was added to later needs no restart.
+- A message is a prompt when it carries a `p` tag for the agent, or when it
+  arrives in a two-member channel. Everything else in a group channel is
+  ignored, and the `allow` list still applies.
+- The channel uuid is the conversation id (`buzz-<uuid>`), so one channel is one
+  OpenCode session. The same rules work over the HTTP API:
+  `POST /v1/messages` with `"conversation": "buzz-<channel-uuid>"` and
+  `GET /v1/conversations/buzz-<channel-uuid>/events`.
+- The agent's `npub` has to be a member of the Buzz relay
+  (`buzz-admin add-member`) or the subscription is closed, same as above.
+
+**Inbound only.** Answers keep going out as encrypted kind-`30078` envelopes to
+the sender's key on `NOSTR_RELAYS`; the Buzz relays are subscribed to and never
+published to, so a Buzz client will not show the agent's replies, and a
+permission request raised by a mention cannot be approved from Buzz.
 
 ```json
 {
@@ -158,6 +190,7 @@ and `hub.emit` (outbound):
 | `hub.go` | Routing, allow list, fan-out to subscribers and transports |
 | `sessions.go` | conversation ↔ OpenCode session mapping |
 | `nostr.go` | Nostr transport: subscribe, decrypt, publish |
+| `buzz.go` | Buzz channels: discover, subscribe, turn a mention into a prompt |
 | `http.go` | `POST /v1/messages`, SSE stream, bearer auth |
 | `registry.go` | Agent config, keys, per-peer NIP-44 key cache |
 
@@ -169,7 +202,12 @@ republishes under its own protocol.
 - Conversations live in memory. A restart drops the conversation→session map and
   dedupe state; agents start fresh conversations. Persist the map if that matters.
 - The Nostr subscription only looks 5 seconds back, so a gateway restart misses
-  messages sent while it was down.
+  messages sent while it was down. Same for a Buzz channel subscription.
+- Buzz is inbound only: replies and permission approvals are not posted back into
+  a channel, and mentions sent as Buzz's rich-content kind (`40002`) rather than
+  kind `9` are not seen.
+- A channel the agent is added to is picked up within a minute; a channel it is
+  removed from keeps its conversation until the next rediscovery.
 - `go test -race` skips `nostr_test.go`: go-nostr v0.52.3 has a data race in its
   own connect path (`Relay.ConnectWithTLS` writing `r.Connection` while
   `Relay.close` reads it, `relay.go:175` vs `relay.go:576`) that fires as soon as
@@ -192,6 +230,8 @@ messages creating exactly one session), cross-agent conversation rejection, the
 reducer's delta/dedupe rules, replay for late SSE subscribers, protocol version
 and body-size rejection, an oversized event surviving the stream, the allow list
 on the Nostr path, HTTP being unable to redirect Nostr replies, registry
-loading and key normalisation from env, and a full Nostr round trip (NIP-44,
-kind, `p` tag routing, encrypted reply) against an in-process fake relay,
-including a relay that demands NIP-42 and authenticates each agent separately.
+loading and key normalisation from env, a Buzz mention and a Buzz DM reaching
+OpenCode (and group chatter not reaching it) with one session per channel, and a
+full Nostr round trip (NIP-44, kind, `p` tag routing, encrypted reply) against
+an in-process fake relay, including a relay that demands NIP-42 and
+authenticates each agent separately.

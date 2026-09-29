@@ -22,6 +22,13 @@ the pool subscribes, and it is the newest published version. If you ever see tha
 race, it is upstream — do not try to "fix" it in gateway code. `go test ./...`
 covers the Nostr path.
 
+The same version builds *identical* NIP-42 auth events when two subscriptions
+answer a challenge in the same second, and it keys the `OK` waiters by event id,
+so one of the two waits out the 7s `Relay.publish` timeout and resubscribes. Two
+subscriptions sharing one closed relay therefore start a few seconds apart, which
+is why the Buzz test gives `BUZZ_RELAYS` its own fake relay instead of pointing
+both relay lists at the same one.
+
 ## Wiring
 
 Everything crosses at exactly two functions: `hub.Handle` (inbound, all
@@ -35,6 +42,14 @@ Data flow: transport → `hub.Handle` → `conversation.ensureSession` (creates 
 OpenCode session once, atomically) → `opencodeClient.promptAsync` → SSE from
 `opencodeClient.events` → `hub.onEvent` → `reduceEvent` → `hub.emit` → subscribers
 (SSE) + the Nostr publish queue.
+
+`buzz.go` is a transport like `nostr.go`, and it is subscribe-only on purpose.
+Buzz relays come from `BUZZ_RELAYS` and are never in `NOSTR_RELAYS`: nothing is
+published to them, because a kind-30078 envelope stored on a Buzz relay surfaces
+in Buzz's own read-state view, and posting kind-9 answers back into a channel is
+not built yet. Inbound is unchanged — a mention becomes a prompt through
+`hub.Handle`, so `allow`, the lock order and one-session-per-conversation all
+still hold.
 
 ## Security invariants — break these and it is a vulnerability, not a style nit
 
