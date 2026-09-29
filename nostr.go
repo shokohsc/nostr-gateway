@@ -23,7 +23,7 @@ const messageKind = 30078
 // It is one transport among others, not a special case — it calls the same hub
 // Handle/emit the HTTP API does.
 type nostrTransport struct {
-	pool   *nostr.SimplePool
+	pools  map[string]*nostr.SimplePool
 	relays []string
 	reg    *Registry
 	hub    *hub
@@ -37,29 +37,52 @@ type job struct {
 	env   Envelope
 }
 
+// One pool per agent, not one pool for the gateway. A closed relay authenticates
+// a connection as exactly one NIP-42 identity and then rejects any event signed
+// by a different key, so a shared pool would have the agents fight over the one
+// authenticated identity — the losers go deaf with no error anywhere.
 func newNostrTransport(ctx context.Context, relays []string, reg *Registry, h *hub, log *slog.Logger) *nostrTransport {
-	return &nostrTransport{
-		pool:   nostr.NewSimplePool(ctx),
+	n := &nostrTransport{
+		pools:  map[string]*nostr.SimplePool{},
 		relays: relays,
 		reg:    reg,
 		hub:    h,
 		log:    log,
 		out:    make(chan job, 256),
 	}
+	for _, name := range reg.names() {
+		a := reg.byName[name]
+		if a.sk == "" {
+			log.Warn("agent has no nsec, skipping nostr", "agent", name)
+			continue
+		}
+		n.pools[name] = nostr.NewSimplePool(ctx,
+			nostr.WithAuthHandler(func(_ context.Context, authEvent nostr.RelayEvent) error {
+				// The pool builds the kind-22242 event; answering the
+				// challenge with the agent's own key is the whole job.
+				return authEvent.Sign(a.sk)
+			}),
+			// Without this go-nostr prints NOTICEs to the stdlib logger,
+			// straight past the gateway's own log level.
+			nostr.WithRelayOptions(nostr.WithNoticeHandler(func(msg string) {
+				log.Warn("nostr notice", "agent", a.Name, "notice", msg)
+			})),
+		)
+	}
+	return n
 }
 
 func (n *nostrTransport) run(ctx context.Context) {
 	go n.worker(ctx)
 	for _, name := range n.reg.names() {
-		a := n.reg.byName[name]
-		if a.sk == "" {
-			n.log.Warn("agent has no nsec, skipping nostr", "agent", name)
-			continue
+		if n.pools[name] != nil {
+			go n.listen(ctx, n.reg.byName[name])
 		}
-		go n.listen(ctx, a)
 	}
 	<-ctx.Done()
-	n.pool.Close("shutdown")
+	for _, p := range n.pools {
+		p.Close("shutdown")
+	}
 }
 
 // worker publishes queued envelopes one at a time so relay traffic keeps the
@@ -79,8 +102,11 @@ func (n *nostrTransport) worker(ctx context.Context) {
 
 // listen subscribes to an agent's kind-30078 events. A CLOSED from a relay (or
 // a dropped connection) ends the subscription rather than the agent, so the
-// loop reconnects instead of leaving the agent deaf.
+// loop reconnects instead of leaving the agent deaf. The pool re-authenticates
+// and re-subscribes on its own when the closed reason is an auth challenge, so
+// a closed relay reaches the second REQ without help from here.
 func (n *nostrTransport) listen(ctx context.Context, a *Agent) {
+	pool := n.pools[a.Name]
 	filter := nostr.Filter{
 		Kinds:   []int{messageKind},
 		Tags:    nostr.TagMap{"p": []string{a.PubKey}},
@@ -93,7 +119,7 @@ func (n *nostrTransport) listen(ctx context.Context, a *Agent) {
 	interval := reconnectBase
 	for ctx.Err() == nil {
 		connected := time.Now()
-		for ie := range n.pool.SubscribeMany(ctx, n.relays, filter) {
+		for ie := range pool.SubscribeMany(ctx, n.relays, filter) {
 			if ie.Event == nil {
 				continue
 			}
@@ -181,6 +207,10 @@ func (n *nostrTransport) reply(a *Agent, peer string, env Envelope) {
 }
 
 func (n *nostrTransport) publish(ctx context.Context, a *Agent, peer string, env Envelope) error {
+	pool, ok := n.pools[a.Name]
+	if !ok {
+		return fmt.Errorf("agent %s has no nostr pool", a.Name)
+	}
 	ck, err := a.conversationKey(peer)
 	if err != nil {
 		return err
@@ -196,15 +226,20 @@ func (n *nostrTransport) publish(ctx context.Context, a *Agent, peer string, env
 	ev := nostr.Event{
 		Kind:      messageKind,
 		CreatedAt: nostr.Now(),
-		Tags:      nostr.Tags{{"p", peer}},
-		Content:   content,
+		// 30078 is inside the NIP-33 parameterized-replaceable range, so a
+		// conforming relay keys it by (kind, author, d) and keeps only the
+		// newest event for each key — with no d tag that is every message
+		// this agent has ever sent. One d tag per envelope gives each message
+		// its own coordinate, so history stays append-only.
+		Tags:    nostr.Tags{{"p", peer}, {"d", env.ID}},
+		Content: content,
 	}
 	if err := ev.Sign(a.sk); err != nil {
 		return err
 	}
 
 	var firstErr error
-	for res := range n.pool.PublishMany(ctx, n.relays, ev) {
+	for res := range pool.PublishMany(ctx, n.relays, ev) {
 		if res.Error != nil && firstErr == nil {
 			firstErr = res.Error
 		}

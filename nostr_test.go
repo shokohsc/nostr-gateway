@@ -34,13 +34,23 @@ type fakeRelay struct {
 	mu    sync.Mutex
 	conns map[*relayConn]struct{}
 	subs  int
+	// requireAuth makes the relay behave like a closed one (Buzz, and most
+	// relays that bill or rate-limit): it challenges on connect, refuses every
+	// REQ until the connection presents a signed kind-22242 event, and refuses
+	// any other event afterwards.
+	requireAuth bool
+	auths       int
 }
 
 type relayConn struct {
 	ws   *websocket.Conn
 	ctx  context.Context
-	mu   sync.Mutex // one writer, and the subids, under one lock
+	mu   sync.Mutex // one writer, the subids and the identity, under one lock
 	subs []string
+	// authPub is the pubkey whose NIP-42 event authenticated this connection,
+	// empty until it does. A closed relay only accepts events signed by exactly
+	// this key, which is why one pool cannot serve two agents.
+	authPub string
 }
 
 func (c *relayConn) write(v any) {
@@ -111,6 +121,11 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 		r.mu.Unlock()
 		ws.CloseNow()
 	}()
+	if r.requireAuth {
+		// Before the first REQ, exactly like a real relay: the client has to
+		// have the challenge in hand by the time the refusal arrives.
+		c.write([]any{"AUTH", authChallenge})
+	}
 
 	for {
 		_, data, err := ws.Read(c.ctx)
@@ -122,9 +137,19 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 			continue
 		}
 		switch string(msg[0]) {
+		case `"AUTH"`:
+			var ev nostr.Event
+			if json.Unmarshal(msg[1], &ev) != nil {
+				continue
+			}
+			c.write([]any{"OK", ev.ID, r.verify(c, &ev), "auth-required: verification failed"})
 		case `"EVENT"`:
 			var ev nostr.Event
 			if json.Unmarshal(msg[1], &ev) != nil {
+				continue
+			}
+			if id := c.identity(); r.requireAuth && id != ev.PubKey {
+				c.write([]any{"OK", ev.ID, false, "invalid: event pubkey does not match authenticated identity"})
 				continue
 			}
 			c.write([]any{"OK", ev.ID, true, ""})
@@ -132,6 +157,11 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 		case `"REQ"`:
 			var subID string
 			_ = json.Unmarshal(msg[1], &subID)
+			if r.requireAuth && c.identity() == "" {
+				c.write([]any{"NOTICE", "auth-required: authenticate before subscribing"})
+				c.write([]any{"CLOSED", subID, "auth-required: not authenticated"})
+				continue
+			}
 			c.mu.Lock()
 			c.subs = append(c.subs, subID)
 			c.mu.Unlock()
@@ -143,6 +173,31 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
+}
+
+func (c *relayConn) identity() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.authPub
+}
+
+const authChallenge = "nostr-gateway-test-challenge"
+
+// verify accepts a NIP-42 event that answers this relay's challenge and pins
+// the connection to the key that signed it.
+func (r *fakeRelay) verify(c *relayConn, ev *nostr.Event) bool {
+	if _, err := ev.CheckSignature(); err != nil ||
+		ev.Tags.Find("challenge").Value() != authChallenge ||
+		ev.Content != "" {
+		return false
+	}
+	c.mu.Lock()
+	c.authPub = ev.PubKey
+	c.mu.Unlock()
+	r.mu.Lock()
+	r.auths++
+	r.mu.Unlock()
+	return true
 }
 
 // broadcast fans an event out to every other connection, tagged with the
@@ -183,6 +238,12 @@ func (r *fakeRelay) subscribeCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.subs
+}
+
+func (r *fakeRelay) authCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.auths
 }
 
 func (r *fakeRelay) dial() *relayConn {
@@ -484,4 +545,44 @@ func TestNostrRoutesByPTag(t *testing.T) {
 		Conversation: "right-agent", Agent: "frontend-agent", Type: TypeMessage, Payload: Payload{Text: "hello"},
 	})
 	waitFor(t, "message addressed to the agent", func() bool { _, p, _ := f.counts(); return p == 1 })
+}
+
+// A closed relay — Buzz, or anything that requires NIP-42 — refuses every REQ
+// from an unauthenticated connection, and then only accepts events signed by
+// the key that authenticated. Without this the gateway resubscribes forever and
+// is silently deaf; with a single shared pool it would work for one agent and
+// leave the other one deaf, so each agent needs its own authenticated pool.
+func TestNostrAuthenticatesPerAgentOnAClosedRelay(t *testing.T) {
+	f := newFakeOC(t)
+	relay := newFakeRelay(t)
+	relay.requireAuth = true
+
+	reg := &Registry{byName: map[string]*Agent{}}
+	for _, name := range []string{"alpha", "beta"} {
+		sk := nostr.GeneratePrivateKey()
+		pk, _ := nostr.GetPublicKey(sk)
+		reg.byName[name] = &Agent{Name: name, OpenCode: f.URL, PubKey: pk, sk: sk, ck: map[string][32]byte{}}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	h.nostr = nt
+	go h.run(ctx)
+	go nt.run(ctx)
+
+	// One challenge answered per agent, and both subscriptions through.
+	waitFor(t, "every agent authenticated", func() bool {
+		return relay.authCount() == 2 && relay.subscribeCount() == 2
+	})
+
+	usk := nostr.GeneratePrivateKey()
+	apk := reg.byName["alpha"].PubKey
+	ck, _ := nip44.GenerateConversationKey(apk, usk)
+	relay.injectFrom(t, usk, apk, ck, Envelope{
+		Conversation: "closed-1", Agent: "alpha", Type: TypeMessage, Payload: Payload{Text: "still there?"},
+	})
+	waitFor(t, "message through a closed relay", func() bool { _, p, _ := f.counts(); return p == 1 })
 }
