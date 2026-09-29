@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -40,6 +41,13 @@ type fakeRelay struct {
 	// any other event afterwards.
 	requireAuth bool
 	auths       int
+	// store makes the relay answer a REQ with everything injected so far before
+	// its EOSE, like a real relay's stored events. It is off by default because
+	// the other tests only ever need live fan-out; a client that has to discover
+	// state by querying (the Buzz channel list) needs it.
+	store     bool
+	stored    []*nostr.Event
+	published int // events the gateway pushed here, as opposed to broadcast
 }
 
 type relayConn struct {
@@ -152,6 +160,9 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 				c.write([]any{"OK", ev.ID, false, "invalid: event pubkey does not match authenticated identity"})
 				continue
 			}
+			r.mu.Lock()
+			r.published++
+			r.mu.Unlock()
 			c.write([]any{"OK", ev.ID, true, ""})
 			r.broadcast(&ev, c)
 		case `"REQ"`:
@@ -167,10 +178,21 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 			c.mu.Unlock()
 			r.mu.Lock()
 			r.subs++
+			stored := append([]*nostr.Event(nil), r.stored...)
 			r.mu.Unlock()
+			for _, ev := range stored {
+				c.write([]any{"EVENT", subID, ev})
+			}
 			c.write([]any{"EOSE", subID})
 		case `"CLOSE"`:
-			return
+			// Only this subscription goes away, like a real relay: closing the
+			// whole connection here would tear down the gateway's other
+			// subscriptions every time a one-shot REQ ends.
+			var subID string
+			_ = json.Unmarshal(msg[1], &subID)
+			c.mu.Lock()
+			c.subs = slices.DeleteFunc(c.subs, func(s string) bool { return s == subID })
+			c.mu.Unlock()
 		}
 	}
 }
@@ -232,12 +254,25 @@ func (r *fakeRelay) broadcast(ev *nostr.Event, except *relayConn) {
 }
 
 // inject simulates another publisher's event arriving at the relay.
-func (r *fakeRelay) inject(ev *nostr.Event) { r.broadcast(ev, nil) }
+func (r *fakeRelay) inject(ev *nostr.Event) {
+	r.mu.Lock()
+	if r.store {
+		r.stored = append(r.stored, ev)
+	}
+	r.mu.Unlock()
+	r.broadcast(ev, nil)
+}
 
 func (r *fakeRelay) subscribeCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.subs
+}
+
+func (r *fakeRelay) publishCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.published
 }
 
 func (r *fakeRelay) authCount() int {
@@ -292,7 +327,7 @@ func TestNostrRoundTrip(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, nil, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -376,7 +411,7 @@ func TestNostrPermissionReply(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, nil, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -439,7 +474,7 @@ func TestNostrAllowList(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, nil, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -479,7 +514,7 @@ func TestHTTPCannotRedirectNostrReplies(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, nil, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -526,7 +561,7 @@ func TestNostrRoutesByPTag(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, nil, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -568,7 +603,7 @@ func TestNostrAuthenticatesPerAgentOnAClosedRelay(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, nil, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -585,4 +620,109 @@ func TestNostrAuthenticatesPerAgentOnAClosedRelay(t *testing.T) {
 		Conversation: "closed-1", Agent: "alpha", Type: TypeMessage, Payload: Payload{Text: "still there?"},
 	})
 	waitFor(t, "message through a closed relay", func() bool { _, p, _ := f.counts(); return p == 1 })
+}
+
+// A Buzz mention is a kind-9 message carrying a p tag for the agent, and a Buzz
+// DM is a two-member channel. The listener finds the agent's channels in the
+// NIP-29 member lists (kind 39002) and subscribes to them by #h, because a relay
+// does not hand channel-scoped events to a subscription that does not name the
+// channel. Group chatter nobody addressed to the agent is not for the agent.
+func TestBuzzMentionsAndDMsReachOpenCode(t *testing.T) {
+	f := newFakeOC(t)
+	relay := newFakeRelay(t)
+	buzz := newFakeRelay(t)
+	buzz.requireAuth = true // a closed relay, like Buzz with BUZZ_REQUIRE_RELAY_MEMBERSHIP
+	buzz.store = true       // discovery has to read the member lists back
+
+	usk := nostr.GeneratePrivateKey()
+	ask := nostr.GeneratePrivateKey()
+	apk, _ := nostr.GetPublicKey(ask)
+	agent := &Agent{Name: "frontend-agent", OpenCode: f.URL, PubKey: apk, sk: ask, ck: map[string][32]byte{}}
+	reg := &Registry{byName: map[string]*Agent{agent.Name: agent}}
+
+	// Everything is published to the Buzz relay before the gateway starts,
+	// because a channel message is only ever delivered to a subscription that
+	// already names the channel — the fake relay replays its stored events to
+	// every REQ, as a real relay does. A three-member channel the agent is in,
+	// a two-member one (a DM), and one message each way.
+	group, dm := "channel-group", "channel-dm"
+	buzz.inject(buzzMembers(t, usk, apk, group, 3))
+	buzz.inject(buzzMembers(t, usk, apk, dm, 2))
+	buzz.inject(buzzMessage(t, usk, group, "", "morning everyone"))
+	buzz.inject(buzzMessage(t, usk, group, apk, "@frontend-agent why is the build red?"))
+	buzz.inject(buzzMessage(t, usk, group, apk, "and now?"))
+	buzz.inject(buzzMessage(t, usk, dm, "", "just the two of us"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, []string{buzz.url()}, reg, h, log)
+	h.nostr = nt
+	go h.run(ctx)
+	go nt.run(ctx)
+
+	// The two mentions and the DM are prompts; the group chatter is not — the
+	// mention is the p tag, not the @name in the text.
+	waitFor(t, "the three addressed messages", func() bool { _, p, _ := f.counts(); return p == 3 })
+	sessions, _, _ := f.counts()
+	f.mu.Lock()
+	texts := make([]string, 0, len(f.prompts))
+	for _, p := range f.prompts {
+		texts = append(texts, p["parts"].([]any)[0].(map[string]any)["text"].(string))
+	}
+	f.mu.Unlock()
+	slices.Sort(texts) // stored events are dispatched concurrently, so unordered
+	for _, want := range []string{"@frontend-agent why is the build red?", "and now?", "just the two of us"} {
+		if !slices.Contains(texts, want) {
+			t.Fatalf("prompt %q missing from %q", want, texts)
+		}
+	}
+
+	// One session per channel: the group had two mentions and reused its own.
+	if sessions != 2 {
+		t.Fatalf("two channels produced %d sessions", sessions)
+	}
+	for _, channel := range []string{group, dm} {
+		if h.convs.get(buzzConversation(channel)) == nil {
+			t.Fatalf("no conversation for channel %s", channel)
+		}
+	}
+
+	// The Buzz relays are subscribed to and nothing else: the agent's answers
+	// are kind-30078 envelopes for the sender's key on the normal relays.
+	if n := buzz.publishCount(); n != 0 {
+		t.Fatalf("published %d events to the buzz relay, want 0", n)
+	}
+}
+
+// buzzMembers is a NIP-29 member list: d is the channel uuid and there is one p
+// tag per member, the agent among them. The other members only need to exist —
+// the gateway counts them, it does not resolve them.
+func buzzMembers(t *testing.T, sk, agent, channel string, members int) *nostr.Event {
+	t.Helper()
+	tags := nostr.Tags{{"d", channel}, {"name", channel}, {"p", agent}}
+	for i := 1; i < members; i++ {
+		tags = append(tags, nostr.Tag{"p", strings.Repeat("ef", 32)})
+	}
+	ev := &nostr.Event{Kind: buzzMemberKind, CreatedAt: nostr.Now(), Tags: tags}
+	if err := ev.Sign(sk); err != nil { // go-nostr drops an event whose signature fails
+		t.Fatal(err)
+	}
+	return ev
+}
+
+// buzzMessage is a NIP-29 chat message: h is the channel, and p is set only when
+// the agent was mentioned.
+func buzzMessage(t *testing.T, sk, channel, mention, text string) *nostr.Event {
+	t.Helper()
+	tags := nostr.Tags{{"h", channel}}
+	if mention != "" {
+		tags = append(tags, nostr.Tag{"p", mention})
+	}
+	ev := &nostr.Event{Kind: buzzChatKind, CreatedAt: nostr.Now(), Tags: tags, Content: text}
+	if err := ev.Sign(sk); err != nil {
+		t.Fatal(err)
+	}
+	return ev
 }

@@ -25,10 +25,12 @@ const messageKind = 30078
 type nostrTransport struct {
 	pools  map[string]*nostr.SimplePool
 	relays []string
-	reg    *Registry
-	hub    *hub
-	log    *slog.Logger
-	out    chan job
+	// buzzRelays are subscribed to and never published to; see buzz.go.
+	buzzRelays []string
+	reg        *Registry
+	hub        *hub
+	log        *slog.Logger
+	out        chan job
 }
 
 type job struct {
@@ -41,14 +43,15 @@ type job struct {
 // a connection as exactly one NIP-42 identity and then rejects any event signed
 // by a different key, so a shared pool would have the agents fight over the one
 // authenticated identity — the losers go deaf with no error anywhere.
-func newNostrTransport(ctx context.Context, relays []string, reg *Registry, h *hub, log *slog.Logger) *nostrTransport {
+func newNostrTransport(ctx context.Context, relays, buzzRelays []string, reg *Registry, h *hub, log *slog.Logger) *nostrTransport {
 	n := &nostrTransport{
-		pools:  map[string]*nostr.SimplePool{},
-		relays: relays,
-		reg:    reg,
-		hub:    h,
-		log:    log,
-		out:    make(chan job, 256),
+		pools:      map[string]*nostr.SimplePool{},
+		relays:     relays,
+		buzzRelays: buzzRelays,
+		reg:        reg,
+		hub:        h,
+		log:        log,
+		out:        make(chan job, 256),
 	}
 	for _, name := range reg.names() {
 		a := reg.byName[name]
@@ -76,7 +79,15 @@ func (n *nostrTransport) run(ctx context.Context) {
 	go n.worker(ctx)
 	for _, name := range n.reg.names() {
 		if n.pools[name] != nil {
-			go n.listen(ctx, n.reg.byName[name])
+			a := n.reg.byName[name]
+			go n.listen(ctx, a)
+			if len(n.buzzRelays) > 0 {
+				// Same pool, so the Buzz connection authenticates as the agent's
+				// own key, which is what a closed Buzz relay checks. Two relays in
+				// both lists means two subscriptions on one connection, where
+				// go-nostr's NIP-42 handshake can stall one of them; see AGENTS.md.
+				go n.buzzListen(ctx, a)
+			}
 		}
 	}
 	<-ctx.Done()
