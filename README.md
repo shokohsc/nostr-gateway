@@ -10,6 +10,7 @@ Implements plan.md.
 
 - **Nostr in, Nostr out.** Kind `30078`, NIP-44 encrypted between the user's key
   and the agent's key. Relays see ciphertext, tags and timestamps, nothing else.
+  NIP-42 `AUTH` is answered with the agent's own key, so closed relays work.
 - **Async conversations.** A message gets an OpenCode session, an `ack`, and
   later events: `message`, `thinking`, `tool_started`, `tool_finished`,
   `permission_request`, `progress`, `completed`, `error`. Nothing waits on a
@@ -67,11 +68,19 @@ Over Nostr, publish the same JSON as the content of a kind `30078` event with a
 ["EVENT", {
   "kind": 30078,
   "created_at": 1790000000,
-  "tags": [["p", "<agent npub hex>"]],
+  "tags": [["p", "<agent npub hex>"], ["d", "<envelope id>"]],
   "content": "<nip44 ciphertext of the envelope>",
   ...
 }]
 ```
+
+The `d` tag is what keeps history. `30078` is inside the NIP-33
+parameterized-replaceable range, so a relay keys those events by
+`(kind, author, d)` and keeps only the newest one for each key — with no `d` tag
+that is every message the author has ever sent, and a Buzz relay will in fact
+treat the kind as its own `KIND_READ_STATE` and store it as such. The gateway
+stamps `d` with the envelope id on every event it publishes; clients should do
+the same.
 
 ## Configuration
 
@@ -84,6 +93,19 @@ Over Nostr, publish the same JSON as the content of a kind `30078` event with a
 | `GATEWAY_TOKEN` | unset | Bearer token for the HTTP API; unset disables auth |
 | `OPENCODE_USER` / `OPENCODE_PASSWORD` | unset | Basic auth for OpenCode servers that require it |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+
+### Relays that require NIP-42
+
+No configuration: each agent answers a relay's `AUTH` challenge with its own
+`nsec` automatically, and gives up on the connection when that fails. Closed
+relays are stricter than that, though — Buzz (and anything else with
+`BUZZ_REQUIRE_RELAY_MEMBERSHIP`) also requires the authenticating pubkey to be a
+member, so the agent's `npub` has to be enrolled on the relay or its
+subscription is closed with `auth-required: verification failed`.
+
+Each agent holds its own pool and therefore its own connection, because a
+closed relay accepts only events signed by the key that authenticated that
+connection.
 
 ```json
 {
@@ -171,4 +193,5 @@ reducer's delta/dedupe rules, replay for late SSE subscribers, protocol version
 and body-size rejection, an oversized event surviving the stream, the allow list
 on the Nostr path, HTTP being unable to redirect Nostr replies, registry
 loading and key normalisation from env, and a full Nostr round trip (NIP-44,
-kind, `p` tag routing, encrypted reply) against an in-process fake relay.
+kind, `p` tag routing, encrypted reply) against an in-process fake relay,
+including a relay that demands NIP-42 and authenticates each agent separately.
