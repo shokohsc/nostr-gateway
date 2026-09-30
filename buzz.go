@@ -176,21 +176,25 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 		}
 
 		filter := nostr.Filter{
-			Kinds:   []int{buzzChatKind},
-			Tags:    nostr.TagMap{"h": ids},
-			Authors: a.Allow, // ponytail: a membership change needs a restart or a config reload, log the count not the list
+			Kinds: []int{buzzChatKind},
+			Tags:  nostr.TagMap{"h": ids},
+			// No authors filter, deliberately: see nostr.listen. A relay-side
+			// allow list would drop a blocked sender before buzzReceive could
+			// name it, and the Warn that names it is the only thing that tells an
+			// operator their allow list is wrong instead of their relay is.
+			// ponytail: a busy channel pays for events the agent then refuses.
 			// The same 5s slack as the kind-30078 subscription: a longer Since
 			// would replay channel history into brand-new OpenCode sessions.
 			Since: ptr(nostr.Now() - 5),
 		}
 		// The REQ that carries this filter goes out on every refresh, but a
 		// refresh that changes nothing logs nothing, so a silent gateway is
-		// indistinguishable from a healthy one. Log what it last asked for:
-		// compared against the relay's own publish log, that is the difference
-		// between a message the relay never delivered and one the gateway
-		// refused (which buzzReceive logs).
+		// indistinguishable from a healthy one. Log what it last asked for,
+		// and whether messages will be refused: compared against the relay's
+		// own publish log, that is the difference between a message the relay
+		// never delivered and one the gateway refused (which buzzReceive logs).
 		n.log.Debug("buzz: asked for channel messages", "agent", a.Name,
-			"channels", len(ids), "authors", len(a.Allow), "relays", n.buzzRelays)
+			"channels", len(ids), "allow_list", len(a.Allow) > 0, "relays", n.buzzRelays)
 		// The subscription gets its own context so a refresh can end it on the
 		// wire: go-nostr turns a cancelled context into a NIP-01 CLOSE, and
 		// leaving the old REQ open would keep the relay fanning out to a stale

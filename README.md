@@ -255,6 +255,15 @@ Nostr identity at all: `GATEWAY_TOKEN` is their gate, and an HTTP envelope's
 `sender` can never make the gateway encrypt that agent's replies to a Nostr key.
 An empty `allow` list accepts anyone.
 
+The list is enforced by the gateway, **not** handed to the relay as a
+subscription filter. A relay drops a non-matching event before delivering it, so
+a relay-side `authors` filter would make a blocked sender — or a typo'd pubkey —
+look identical to a broken relay: the agent goes deaf and nothing is logged. The
+gateway applies `allow` itself, which is both the real security boundary and the
+place where the refusal can be logged with the pubkey that caused it. The cost is
+fan-out: the relay streams every event in the subscribed kinds to the gateway
+and the gateway throws the blocked ones away.
+
 ```bash
 go build -o nostr-gateway .
 
@@ -306,6 +315,10 @@ republishes under its own protocol.
   one request per id. There is no rate limit and no cap either.
 - The Nostr subscription only looks 5 seconds back, so a gateway restart misses
   messages sent while it was down. Same for a Buzz channel subscription.
+- `allow` is not a relay-side filter, so the relay streams every event in the
+  subscribed kinds to the gateway and the gateway discards the blocked ones. A
+  busy channel with a short allow list pays that fan-out. See the `allow`
+  section above for why it is not pushed down to the relay.
 - Buzz carries the answer back as a kind `9` in the channel, but only the answer:
   tool calls, reasoning and progress are not posted. A permission request raised
   by a mention is posted and cannot be answered from the channel.
@@ -354,7 +367,8 @@ reducer's delta/dedupe rules, replay for late SSE subscribers, the OpenAI surfac
 unknown model rejected, and a continued conversation not carrying the previous
 turn's answer), protocol version
 and body-size rejection, an oversized event surviving the stream, the allow list
-on the Nostr path, HTTP being unable to redirect Nostr replies, registry
+on the Nostr path (and *not* leaking it to the relay as a subscription filter),
+HTTP being unable to redirect Nostr replies, registry
 loading and key normalisation from env, a Buzz mention and a Buzz DM reaching
 OpenCode (and group chatter not reaching it) with one session per channel, a
 streamed answer assembled into one kind-9 channel message with nothing published

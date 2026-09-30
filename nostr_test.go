@@ -57,6 +57,11 @@ type fakeRelay struct {
 	published []int          // kinds the gateway pushed here, as opposed to broadcast
 	posts     []*nostr.Event // the same events, whole, for tag and content assertions
 	opened    int            // websocket connections ever accepted
+	// filters records what each REQ actually asked for. The relay does not
+	// enforce filters, which is what lets these tests inject anything from
+	// anyone, so without this the one part of a filter that matters in
+	// production — the relay-side narrowing — is invisible to every test here.
+	filters []nostr.Filter
 }
 
 type relayConn struct {
@@ -197,11 +202,16 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 				c.write([]any{"CLOSED", subID, "auth-required: not authenticated"})
 				continue
 			}
+			var f nostr.Filter
+			if len(msg) > 2 {
+				_ = json.Unmarshal(msg[2], &f)
+			}
 			c.mu.Lock()
 			c.subs = append(c.subs, subID)
 			c.mu.Unlock()
 			r.mu.Lock()
 			r.subs++
+			r.filters = append(r.filters, f)
 			stored := append([]*nostr.Event(nil), r.stored...)
 			r.mu.Unlock()
 			for _, ev := range stored {
@@ -661,6 +671,69 @@ func TestNostrAuthenticatesPerAgentOnAClosedRelay(t *testing.T) {
 		Conversation: "closed-1", Agent: "alpha", Type: TypeMessage, Payload: Payload{Text: "still there?"},
 	})
 	waitFor(t, "message through a closed relay", func() bool { _, p, _ := f.counts(); return p == 1 })
+}
+
+// The allow list must not go into the relay-side filter, on either transport.
+// A relay enforces `authors` before it delivers, so a sender the agent does not
+// allow is dropped by the relay and never reaches the gateway's own allows()
+// check — which means the refusal is never logged, and the agent is deaf for
+// both Buzz and kind-30078 with nothing at all in the log. That is exactly the
+// failure a Warn was added to prevent, so the outer filter has to go: the
+// client-side check is the security boundary (it runs before decryption) and it
+// is the only one that can say why. The cost is fan-out for events the agent
+// then refuses, which a channel-sized relay makes cheap.
+func TestAllowListIsNotARelaySideFilter(t *testing.T) {
+	f := newFakeOC(t)
+	relay := newFakeRelay(t)
+	relay.store = true
+	relay.requireAuth = true
+
+	allowed := strings.Repeat("ab", 32)
+	reg := &Registry{byName: map[string]*Agent{
+		"frontend-agent": {
+			Name: "frontend-agent", OpenCode: f.URL, PubKey: strings.Repeat("cd", 32),
+			sk: nostr.GeneratePrivateKey(), ck: map[string][32]byte{},
+			Allow: []string{allowed},
+		},
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, []string{relay.url()}, reg, h, log)
+	h.nostr = nt
+	go h.run(ctx)
+	go nt.run(ctx)
+
+	// One channel the agent is in, so the Buzz listener gets past discovery and
+	// issues its kind-9 REQ.
+	relay.store = true
+	relay.inject(buzzMembers(t, nostr.GeneratePrivateKey(), reg.byName["frontend-agent"].PubKey, "chan-1", 2))
+
+	// One subscription per role: kind-30078, and the Buzz channel filter.
+	waitFor(t, "both transports subscribed", func() bool {
+		relay.mu.Lock()
+		defer relay.mu.Unlock()
+		var chat int
+		for _, f := range relay.filters {
+			for _, k := range f.Kinds {
+				if k == 9 {
+					chat++
+				}
+			}
+		}
+		return len(relay.filters) >= 2 && chat >= 1
+	})
+
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	for i, f := range relay.filters {
+		if len(f.Authors) != 0 {
+			t.Errorf("REQ %d asks the relay for authors %v: a blocked sender is dropped "+
+				"by the relay and the gateway never logs the refusal", i, f.Authors)
+		}
+	}
 }
 
 // A Buzz mention is a kind-9 message carrying a p tag for the agent, and a Buzz

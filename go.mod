@@ -1,6 +1,6 @@
 module opencode-nostr-gateway
 
-go 1.26.0
+go 1.27.1
 
 require (
 	github.com/coder/websocket v1.8.15

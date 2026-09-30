@@ -15,13 +15,14 @@ go test -run TestPermissionV2Server -v .      # one test; ./... is a single pack
 go build -o /tmp/gateway .                     # build outside the tree, do not litter
 ```
 
-The module targets Go 1.26 and the toolchain is pinned to a released 1.27.x, so
-CI installs whatever `go.mod` asks for. `.github/workflows/ci.yml` is the
-authoritative list of what has to pass: `gofmt`, `go build`, `go vet`, staticcheck
-(unused code — `go vet` does not look), `go mod tidy -diff`, `go test`,
-`go test -race`, govulncheck, and a `docker build`. Add the check there, not a
-third step in your head, and pin any tool version rather than using `@latest` so
-a new release cannot break main.
+`go.mod`'s `go` directive is the single source of truth for the Go version: the
+Dockerfile tag and CI's `go-version-file` both read it. It is `1.27.1` and it has
+to stay at or above the patch release that fixes the current stdlib CVEs — the
+CI `govulncheck` step exists to catch a *lowered* directive, because that is how
+the gateway ends up running an unpatched `net/http`, `crypto/tls` and `crypto/x509`
+with nothing saying so. Add a check to `.github/workflows/ci.yml`, not a third step
+in your head, and pin any tool version rather than using `@latest` so a new release
+cannot break main.
 
 `go test` and `go test -race` have different file sets: `nostr_test.go` carries
 `//go:build !race`, so `-race` skips it. Reason: go-nostr v0.52.3 has a data race
@@ -113,6 +114,19 @@ that swallows its result makes the agent deaf with nothing in the log.
   keeps blocked senders away from the cipher). HTTP callers have no Nostr
   identity; their gate is the `GATEWAY_TOKEN` bearer. An empty `allow` accepts
   anyone, so the gateway logs a warning when `GATEWAY_TOKEN` is unset.
+- **`allow` is enforced gateway-side and must never go into a subscription
+  filter.** Both `nostr.listen` and `buzzListen` used to set `Authors: a.Allow`,
+  which is the same deafness one layer out: a relay applies `authors` before
+  delivering, so a blocked sender — or a pubkey that is not in the list because
+  of a typo — is dropped by the relay and never reaches the gateway's own
+  `allows()` check. Every log line explaining that refusal was therefore
+  unreachable, and the agent was deaf on both transports with a clean log. The
+  gateway-side check is the real boundary, so keep the filter wide and take the
+  fan-out; a relay-side filter is only safe paired with a periodic self-REQ to
+  prove delivery. `TestAllowListIsNotARelaySideFilter` is the guard. Note that
+  the fake relay ignores filters entirely — the REQ handler replays every stored
+  event to every subscriber — so it can only catch a filter that was never sent,
+  never one the relay would honour.
 - **Keys are normalised to hex exactly once**, in `loadRegistry`. A bech32 pubkey
   reaching go-nostr produces a `p` tag filter that never matches a real relay —
   the agent goes silently deaf, with no error anywhere. `TestNostrRoutesByPTag`

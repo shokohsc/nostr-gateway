@@ -168,9 +168,15 @@ func (n *nostrTransport) worker(ctx context.Context) {
 func (n *nostrTransport) listen(ctx context.Context, a *Agent) {
 	pool := n.pools[a.Name]
 	filter := nostr.Filter{
-		Kinds:   []int{messageKind},
-		Tags:    nostr.TagMap{"p": []string{a.PubKey}},
-		Authors: a.Allow,
+		Kinds: []int{messageKind},
+		Tags:  nostr.TagMap{"p": []string{a.PubKey}},
+		// No authors filter, deliberately. The allow list is the security
+		// boundary in receive, which checks it before decryption, but a relay
+		// that narrows by author would drop a blocked sender before it ever
+		// arrives — and then the refusal cannot be logged, so a sender who is
+		// simply not on the list looks exactly like a lost relay event.
+		// ponytail: extra fan-out for events the agent then refuses; a relay-side
+		// authors filter plus a periodic self-REQ is how to get both.
 		// A small Since avoids replaying a fresh deployment's stored history
 		// into brand-new OpenCode sessions. ponytail: a few seconds of slack
 		// because relay clocks differ; a durable cursor is the upgrade.
