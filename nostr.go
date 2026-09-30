@@ -28,6 +28,16 @@ type nostrTransport struct {
 	// buzzRelays are subscribed to and never published to, apart from the
 	// agent profile; see buzz.go.
 	buzzRelays []string
+	// buzzPools are the same agents' pools for buzzRelays, one connection
+	// each. They are separate from pools because a relay named in both lists
+	// would otherwise put the kind-30078 listener and the Buzz discovery on one
+	// websocket, where their NIP-42 handshakes collide: go-nostr keys its OK
+	// waiters by event id (relay.go:371), two handshakes built in the same
+	// second are byte-identical, the second Store overwrites the first, and the
+	// loser waits out its whole context instead of returning. The Buzz
+	// discovery holds a 15s deadline, so it stalled for all of it, came back
+	// empty with the member list right there, and the agent heard nothing.
+	buzzPools map[string]*nostr.SimplePool
 	// profiled remembers which agents have published their Buzz agent profile.
 	// One writer per key — that agent's buzzListen goroutine.
 	profiled map[string]bool
@@ -47,11 +57,16 @@ type job struct {
 // a connection as exactly one NIP-42 identity and then rejects any event signed
 // by a different key, so a shared pool would have the agents fight over the one
 // authenticated identity — the losers go deaf with no error anywhere.
+//
+// And one pool per role, for the same reason one layer down: a relay in both
+// NOSTR_RELAYS and BUZZ_RELAYS gets a second pool, so the message listener and
+// the Buzz discovery never answer a challenge on the same connection.
 func newNostrTransport(ctx context.Context, relays, buzzRelays []string, reg *Registry, h *hub, log *slog.Logger) *nostrTransport {
 	n := &nostrTransport{
 		pools:      map[string]*nostr.SimplePool{},
 		relays:     relays,
 		buzzRelays: buzzRelays,
+		buzzPools:  map[string]*nostr.SimplePool{},
 		profiled:   map[string]bool{},
 		reg:        reg,
 		hub:        h,
@@ -64,20 +79,29 @@ func newNostrTransport(ctx context.Context, relays, buzzRelays []string, reg *Re
 			log.Warn("agent has no nsec, skipping nostr", "agent", name)
 			continue
 		}
-		n.pools[name] = nostr.NewSimplePool(ctx,
-			nostr.WithAuthHandler(func(_ context.Context, authEvent nostr.RelayEvent) error {
-				// The pool builds the kind-22242 event; answering the
-				// challenge with the agent's own key is the whole job.
-				return authEvent.Sign(a.sk)
-			}),
-			// Without this go-nostr prints NOTICEs to the stdlib logger,
-			// straight past the gateway's own log level.
-			nostr.WithRelayOptions(nostr.WithNoticeHandler(func(msg string) {
-				log.Warn("nostr notice", "agent", a.Name, "notice", msg)
-			})),
-		)
+		n.pools[name] = newAgentPool(ctx, a, log)
+		if len(buzzRelays) > 0 {
+			n.buzzPools[name] = newAgentPool(ctx, a, log)
+		}
 	}
 	return n
+}
+
+// newAgentPool builds one agent's pool: it authenticates as that agent's key and
+// nothing else, and keeps relay NOTICEs inside the gateway's own log level.
+func newAgentPool(ctx context.Context, a *Agent, log *slog.Logger) *nostr.SimplePool {
+	return nostr.NewSimplePool(ctx,
+		nostr.WithAuthHandler(func(_ context.Context, authEvent nostr.RelayEvent) error {
+			// The pool builds the kind-22242 event; answering the
+			// challenge with the agent's own key is the whole job.
+			return authEvent.Sign(a.sk)
+		}),
+		// Without this go-nostr prints NOTICEs to the stdlib logger,
+		// straight past the gateway's own log level.
+		nostr.WithRelayOptions(nostr.WithNoticeHandler(func(msg string) {
+			log.Warn("nostr notice", "agent", a.Name, "notice", msg)
+		})),
+	)
 }
 
 func (n *nostrTransport) run(ctx context.Context) {
@@ -86,17 +110,20 @@ func (n *nostrTransport) run(ctx context.Context) {
 		if n.pools[name] != nil {
 			a := n.reg.byName[name]
 			go n.listen(ctx, a)
-			if len(n.buzzRelays) > 0 {
-				// Same pool, so the Buzz connection authenticates as the agent's
-				// own key, which is what a closed Buzz relay checks. Two relays in
-				// both lists means two subscriptions on one connection, where
-				// go-nostr's NIP-42 handshake can stall one of them; see AGENTS.md.
+			if n.buzzPools[name] != nil {
+				// Its own pool, so the Buzz connection authenticates as the
+				// agent's own key on a connection of its own, which is what a
+				// closed Buzz relay checks and what keeps its handshake from
+				// colliding with the listener's.
 				go n.buzzListen(ctx, a)
 			}
 		}
 	}
 	<-ctx.Done()
 	for _, p := range n.pools {
+		p.Close("shutdown")
+	}
+	for _, p := range n.buzzPools {
 		p.Close("shutdown")
 	}
 }

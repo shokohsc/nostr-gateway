@@ -54,6 +54,7 @@ type fakeRelay struct {
 	store     bool
 	stored    []*nostr.Event
 	published []int // kinds the gateway pushed here, as opposed to broadcast
+	opened    int   // websocket connections ever accepted
 }
 
 type relayConn struct {
@@ -128,6 +129,7 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 	c := &relayConn{ws: ws, ctx: context.Background()}
 	r.mu.Lock()
 	r.conns[c] = struct{}{}
+	r.opened++
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
@@ -299,6 +301,14 @@ func (r *fakeRelay) authCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.auths
+}
+
+// opened returns how many websocket connections this relay has ever accepted,
+// so a test can assert that two subscriptions did not share one.
+func (r *fakeRelay) openedCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.opened
 }
 
 func (r *fakeRelay) dial() *relayConn {
@@ -761,6 +771,99 @@ func TestBuzzDiscoverySurvivesALostNIP42Handshake(t *testing.T) {
 	if kinds := buzz.publishKinds(); !slices.Equal(kinds, []int{buzzProfileKind}) {
 		t.Fatalf("published %v to the buzz relay, want just [%d]", kinds, buzzProfileKind)
 	}
+}
+
+// Production wires NOSTR_RELAYS and BUZZ_RELAYS to the same relay — the Buzz
+// relay is where the kind-30078 answers have to land, and it is also the only
+// one the agent is a member of. That puts the message listener and the Buzz
+// discovery on one websocket, and go-nostr keys its NIP-42 OK waiters by event
+// id (relay.go:371): the two handshakes are built in the same second, so they
+// are byte-identical, the second Store overwrites the first, and the loser of
+// the pair waits out its entire context instead of returning. The Buzz
+// discovery holds a 15s deadline, so it came back empty after 15s with the
+// member list sitting right there, the agent subscribed to no channel at all,
+// and every mention went unheard for a whole refresh interval.
+func TestBuzzDiscoveryOnARelaySharedWithTheMessageListener(t *testing.T) {
+	f := newFakeOC(t)
+	relay := newFakeRelay(t)
+	relay.requireAuth = true
+	relay.store = true
+
+	usk := nostr.GeneratePrivateKey()
+	ask := nostr.GeneratePrivateKey()
+	apk, _ := nostr.GetPublicKey(ask)
+	agent := &Agent{Name: "frontend-agent", OpenCode: f.URL, PubKey: apk, sk: ask, ck: map[string][32]byte{}}
+	reg := &Registry{byName: map[string]*Agent{agent.Name: agent}}
+
+	group := "channel-shared-relay"
+	relay.inject(buzzMembers(t, usk, apk, group, 3))
+	relay.inject(buzzMessage(t, usk, group, apk, "@frontend-agent are you there?"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, []string{relay.url()}, reg, h, log)
+	h.nostr = nt
+	go h.run(ctx)
+	go nt.run(ctx)
+
+	// The mention only arrives on a discovery that answered, so reaching
+	// OpenCode inside waitFor's 5s is proof the handshake did not stall: a
+	// stalled one takes the whole buzzFetchTimeout.
+	waitFor(t, "the mention on a relay that is also a message relay", func() bool {
+		_, p, _ := f.counts()
+		return p == 1
+	})
+	if h.convs.get(buzzConversation(group)) == nil {
+		t.Fatal("the channel the agent is in has no conversation")
+	}
+	// And the two roles must not have shared a connection. Which of the
+	// colliding handshakes loses is a coin flip, so this is what makes the
+	// assertion above deterministic.
+	if n := relay.openedCount(); n < 2 {
+		t.Fatalf("%d connection to a relay filling both roles, want one per role", n)
+	}
+}
+
+// The agent profile (kind 10100) is what makes the pubkey show up as an agent in
+// Buzz, and the Buzz UI is how an agent gets added to a channel in the first
+// place. Gating the profile on a discovery that found a channel is a bootstrap
+// deadlock: a relay that serves member lists naming no channel in particular
+// leaves the agent unregistered, and an unregistered agent can never be added to
+// the first one. A member list is all the proof of NIP-42 the profile needs.
+func TestBuzzProfileIsPublishedWhenNoRosterNamesTheAgent(t *testing.T) {
+	f := newFakeOC(t)
+	relay := newFakeRelay(t)
+	relay.requireAuth = true
+	relay.store = true
+
+	usk := nostr.GeneratePrivateKey()
+	ask := nostr.GeneratePrivateKey()
+	apk, _ := nostr.GetPublicKey(ask)
+	agent := &Agent{Name: "frontend-agent", OpenCode: f.URL, PubKey: apk, sk: ask, ck: map[string][32]byte{}}
+	reg := &Registry{byName: map[string]*Agent{agent.Name: agent}}
+
+	// A member list with no channel identifier: the relay answered the
+	// discovery, and nothing it sent names a channel this agent is in.
+	roster := &nostr.Event{Kind: buzzMemberKind, CreatedAt: nostr.Now(), Tags: nostr.Tags{{"p", apk}}}
+	if err := roster.Sign(usk); err != nil {
+		t.Fatal(err)
+	}
+	relay.inject(roster)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, []string{relay.url()}, reg, h, log)
+	h.nostr = nt
+	go h.run(ctx)
+	go nt.run(ctx)
+
+	waitFor(t, "the agent profile before any channel exists", func() bool {
+		return slices.Equal(relay.publishKinds(), []int{buzzProfileKind})
+	})
 }
 
 // buzzMembers is a NIP-29 member list: d is the channel uuid and there is one p

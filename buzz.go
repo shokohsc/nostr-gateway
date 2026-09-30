@@ -69,15 +69,23 @@ func buzzConversation(channel string) string { return "buzz-" + channel }
 // ends at EOSE and answers a NIP-42 challenge on the way, so a closed relay
 // works here exactly as it does for the kind-30078 subscription. The timeout is
 // the point: this is the one call in the gateway whose failure mode is silence.
-func (n *nostrTransport) buzzDiscover(ctx context.Context, a *Agent) buzzChannels {
+//
+// It also returns how many member lists the relay served, and that is not
+// cosmetic. "No channel" and "no member lists at all" have opposite fixes — add
+// the agent to a channel, versus the relay is not serving kind 39002 to us —
+// and NIP-29 calls 39002 optional, with relays free to restrict who may fetch
+// it. Collapsing the two into one log line is what sends an operator to fix the
+// wrong thing.
+func (n *nostrTransport) buzzDiscover(ctx context.Context, a *Agent) (buzzChannels, int) {
 	ctx, cancel := context.WithTimeout(ctx, buzzFetchTimeout)
 	defer cancel()
-	chans := buzzChannels{}
+	chans, rosters := buzzChannels{}, 0
 	filter := nostr.Filter{Kinds: []int{buzzMemberKind}, Tags: nostr.TagMap{"p": []string{a.PubKey}}}
-	for ie := range n.pools[a.Name].FetchMany(ctx, n.buzzRelays, filter) {
+	for ie := range n.buzzPools[a.Name].FetchMany(ctx, n.buzzRelays, filter) {
 		if ie.Event == nil {
 			continue // EOSE, or a subscription the relay closed
 		}
+		rosters++
 		channel := ie.Event.Tags.GetD()
 		if channel == "" {
 			continue
@@ -88,7 +96,7 @@ func (n *nostrTransport) buzzDiscover(ctx context.Context, a *Agent) buzzChannel
 		}
 		chans[channel] = members
 	}
-	return chans
+	return chans, rosters
 }
 
 // buzzListen subscribes to the agent's channels, rediscovering them on a timer
@@ -96,38 +104,59 @@ func (n *nostrTransport) buzzDiscover(ctx context.Context, a *Agent) buzzChannel
 // listener, with one difference: the #h list is only as good as the last
 // discovery, so a channel joined later only arrives on the next one.
 func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
-	pool := n.pools[a.Name]
+	pool := n.buzzPools[a.Name]
 	interval, seen := reconnectBase, ""
 	for ctx.Err() == nil {
 		connected := time.Now()
-		chans := n.buzzDiscover(ctx, a)
-		if len(chans) == 0 {
+		chans, rosters := n.buzzDiscover(ctx, a)
+		if rosters == 0 {
 			// A relay that returns no member lists at all has not really
 			// answered — see buzzRetryDelay. Ask again before believing it.
 			n.log.Warn("buzz: discovery came back with no member lists", "agent", a.Name, "relays", n.buzzRelays)
 			if !wait(ctx, buzzRetryDelay) {
 				return
 			}
-			chans = n.buzzDiscover(ctx, a)
+			chans, rosters = n.buzzDiscover(ctx, a)
 		}
+		if rosters == 0 {
+			// Still nothing at all, and now twice over, so the retry has had
+			// its chance. NIP-29 makes 39002 optional and lets a relay restrict
+			// who may fetch it, so this is the case where the relay is not
+			// serving the member lists — not the case where the agent is in no
+			// channel. Say so, and keep looking.
+			n.log.Warn("buzz: relay serves no member lists for this agent", "agent", a.Name,
+				"relays", n.buzzRelays, "pubkey", a.PubKey[:8],
+				"hint", "NIP-29 kind 39002 is optional and a relay may restrict who may fetch it: check the relay serves it to this pubkey, and that the pubkey is a relay member (buzz-admin add-member)")
+			if !wait(ctx, buzzRefresh) {
+				return
+			}
+			continue
+		}
+		// The relay answered with member lists, which is also what proves the
+		// connection passed NIP-42. Register the agent even when none of those
+		// rosters name it: Buzz reads kind 10100 to know which pubkeys are
+		// agents, and until it is published the agent is invisible in the
+		// channel UI, so the operator cannot even add it to one. Gating this
+		// on a non-empty result is a bootstrap deadlock.
+		n.buzzProfile(ctx, a)
+
 		ids := make([]string, 0, len(chans))
 		for id := range chans {
 			ids = append(ids, id)
 		}
 		slices.Sort(ids) // a stable filter, so the REQ does not reshuffle itself
 		if len(ids) == 0 {
-			// Now it is an answer: the relay has the agent's member lists and
-			// none of them name it. This is a wait for a join, not a failed
-			// connection, so it does not back off. Publishing the agent profile
-			// also waits for this point — it needs an authenticated connection.
+			// A real answer: the relay has member lists and none of them name
+			// this pubkey. A wait for a join, not a failed connection, so it
+			// does not back off.
 			n.log.Warn("buzz: agent is in no channel yet", "agent", a.Name,
-				"hint", "no kind-39002 member list on the relay names this pubkey: add it to a channel, then reconcile the rosters")
+				"rosters", rosters,
+				"hint", "the relay's kind-39002 member lists do not name this pubkey: add it to a channel, then reconcile the rosters")
 			if !wait(ctx, buzzRefresh) {
 				return
 			}
 			continue
 		}
-		n.buzzProfile(ctx, a)
 		if joined := strings.Join(ids, ","); joined != seen {
 			seen = joined
 			n.log.Info("buzz channels", "agent", a.Name, "channels", joined)
@@ -180,19 +209,21 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 }
 
 // buzzProfile publishes the NIP-OA agent profile, once per agent per process,
-// the first time a Buzz relay has answered with a member list. Buzz derives an
-// agent's channel pills from these events (kind 10100), and without one the
-// agent is a member of the relay but invisible in the agent UI — which is the
-// one thing an operator cannot fix by hand, because the profile has to be
-// signed by the agent's own key and the gateway is the only holder of it.
+// the first time a Buzz relay has answered a discovery with a member list.
+// Buzz derives an agent's channel pills from these events (kind 10100), and
+// without one the agent is a member of the relay but invisible in the agent UI —
+// which is the one thing an operator cannot fix by hand, because the profile has
+// to be signed by the agent's own key and the gateway is the only holder of it.
 //
 // This is the single exception to "a Buzz relay is subscribed to, never
 // published to". It is safe because 10100 is replaceable (one event per author),
 // carries no channel traffic, and does not show up in Buzz's read-state view,
-// which is what that rule protects. The profile is only published after a
-// successful discovery, because that is what proves the connection passed
-// NIP-42 — a profile pushed onto an unauthenticated connection is simply
-// refused.
+// which is what that rule protects. It is only published once a discovery has
+// come back with a member list, because that is what proves the connection
+// passed NIP-42 — a profile pushed onto an unauthenticated connection is simply
+// refused. An empty *result* is not required: rosters that name no channel still
+// prove the point, and waiting for one is how an unregistered agent never gets
+// added to a channel in the first place.
 func (n *nostrTransport) buzzProfile(ctx context.Context, a *Agent) {
 	// One writer per agent: buzzListen is the only caller, one goroutine each.
 	if n.profiled[a.Name] {
@@ -213,7 +244,7 @@ func (n *nostrTransport) buzzProfile(ctx context.Context, a *Agent) {
 		return
 	}
 	var firstErr error
-	for res := range n.pools[a.Name].PublishMany(ctx, n.buzzRelays, ev) {
+	for res := range n.buzzPools[a.Name].PublishMany(ctx, n.buzzRelays, ev) {
 		if res.Error != nil && firstErr == nil {
 			firstErr = res.Error
 		}
