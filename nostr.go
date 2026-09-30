@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -25,8 +26,8 @@ const messageKind = 30078
 type nostrTransport struct {
 	pools  map[string]*nostr.SimplePool
 	relays []string
-	// buzzRelays are subscribed to and never published to, apart from the
-	// agent profile; see buzz.go.
+	// buzzRelays carry Buzz channel traffic in both directions, plus the agent
+	// profile; see buzz.go.
 	buzzRelays []string
 	// buzzPools are the same agents' pools for buzzRelays, one connection
 	// each. They are separate from pools because a relay named in both lists
@@ -38,6 +39,10 @@ type nostrTransport struct {
 	// discovery holds a 15s deadline, so it stalled for all of it, came back
 	// empty with the member list right there, and the agent heard nothing.
 	buzzPools map[string]*nostr.SimplePool
+	// turns holds the answer in flight per Buzz conversation, so a turn becomes
+	// one channel message instead of one per streaming delta. Owned by the
+	// publish worker goroutine, which is its only writer.
+	turns map[string]*strings.Builder
 	// profiled remembers which agents have published their Buzz agent profile.
 	// One writer per key — that agent's buzzListen goroutine.
 	profiled map[string]bool
@@ -47,9 +52,13 @@ type nostrTransport struct {
 	out      chan job
 }
 
+// job is one outbound envelope. buzz is the channel uuid when the conversation
+// is a Buzz channel and "" otherwise, which is what decides whether the answer
+// goes into a channel or out as a kind-30078 envelope.
 type job struct {
 	agent *Agent
 	peer  string
+	buzz  string
 	env   Envelope
 }
 
@@ -67,6 +76,7 @@ func newNostrTransport(ctx context.Context, relays, buzzRelays []string, reg *Re
 		relays:     relays,
 		buzzRelays: buzzRelays,
 		buzzPools:  map[string]*nostr.SimplePool{},
+		turns:      map[string]*strings.Builder{},
 		profiled:   map[string]bool{},
 		reg:        reg,
 		hub:        h,
@@ -129,14 +139,21 @@ func (n *nostrTransport) run(ctx context.Context) {
 }
 
 // worker publishes queued envelopes one at a time so relay traffic keeps the
-// order the agent produced it in.
+// order the agent produced it in. It is also the only writer of the in-flight
+// Buzz turns, so an answer is posted as one message the moment its turn ends.
 func (n *nostrTransport) worker(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case j := <-n.out:
-			if err := n.publish(ctx, j.agent, j.peer, j.env); err != nil {
+			var err error
+			if j.buzz != "" {
+				err = n.buzzJob(ctx, j)
+			} else {
+				err = n.publish(ctx, j.agent, j.peer, j.env)
+			}
+			if err != nil {
 				n.log.Error("nostr publish", "agent", j.agent.Name, "err", err)
 			}
 		}
@@ -227,12 +244,22 @@ func (n *nostrTransport) receive(ctx context.Context, a *Agent, ev *nostr.Event)
 	return nil
 }
 
+// send queues one outbound envelope. A conversation that is a Buzz channel goes
+// into that channel as a kind-9 message; anything else goes out as the encrypted
+// kind-30078 envelope the protocol has always used. The conversation id carries
+// the route, so the hub — which is transport-blind — does not have to know.
 func (n *nostrTransport) send(a *Agent, peer string, env Envelope) error {
 	if a.sk == "" {
 		return fmt.Errorf("agent %s has no private key", a.Name)
 	}
+	buzz, _ := buzzChannelOf(env.Conversation)
+	if buzz != "" && n.buzzPools[a.Name] == nil {
+		// A channel conversation with no Buzz pool (BUZZ_RELAYS unset) still has
+		// to reach the person who wrote in it, so fall back to the envelope.
+		buzz = ""
+	}
 	select {
-	case n.out <- job{agent: a, peer: peer, env: env}:
+	case n.out <- job{agent: a, peer: peer, buzz: buzz, env: env}:
 		return nil
 	case <-time.After(5 * time.Second):
 		// Backpressure beats silently dropping: the emitter is an OpenCode
@@ -244,7 +271,14 @@ func (n *nostrTransport) send(a *Agent, peer string, env Envelope) error {
 // reply sends one envelope straight out, bypassing the ordered queue: it is a
 // terminal answer to a message that will produce nothing else.
 func (n *nostrTransport) reply(a *Agent, peer string, env Envelope) {
-	if err := n.publish(context.Background(), a, peer, env); err != nil {
+	ctx := context.Background()
+	var err error
+	if channel, ok := buzzChannelOf(env.Conversation); ok && n.buzzPools[a.Name] != nil {
+		err = n.buzzPost(ctx, a, channel, peer, env.Payload.Text)
+	} else {
+		err = n.publish(ctx, a, peer, env)
+	}
+	if err != nil {
 		n.log.Error("nostr reply", "agent", a.Name, "err", err)
 	}
 }

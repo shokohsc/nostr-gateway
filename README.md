@@ -133,7 +133,7 @@ the same.
 | `AGENTS_FILE` | — | Path to the agent registry (required) |
 | `AGENTS` | — | Same JSON inline, used when `AGENTS_FILE` is unset |
 | `NOSTR_RELAYS` | `wss://nos.lol,wss://relay.damus.io` | Comma-separated relay URLs |
-| `BUZZ_RELAYS` | unset | Comma-separated Buzz relay URLs. Set it and each agent also listens to the Buzz channels it is a member of; nothing is ever published there apart from the agent profile. A relay may be named in both this and `NOSTR_RELAYS`: Buzz gets its own connection either way |
+| `BUZZ_RELAYS` | unset | Comma-separated Buzz relay URLs. Set it and each agent joins the Buzz channels it is a member of, answers mentions in the channel, and publishes its agent profile. A relay may be named in both this and `NOSTR_RELAYS`: Buzz gets its own connection either way |
 | `GATEWAY_ADDR` | `:8080` | HTTP listen address |
 | `GATEWAY_TOKEN` | unset | Bearer token for the HTTP API; unset disables auth |
 | `OPENCODE_USER` / `OPENCODE_PASSWORD` | unset | Basic auth for OpenCode servers that require it |
@@ -189,8 +189,18 @@ export BUZZ_RELAYS='ws://buzz.example.internal:3000'
 - The agent's `npub` has to be a member of the Buzz relay
   (`buzz-admin add-member`) or the subscription is closed, same as above.
 
-**One thing is published to the Buzz relays**: the NIP-OA agent profile
-(kind `10100`), which is what Buzz reads to know which pubkeys are agents, and
+**What is published to the Buzz relays**: the agent's answers, and one other kind
+of event. An answer to a channel message is a kind `9` in that same channel,
+signed by the agent's own key, with an `h` tag for the channel and a `p` tag for
+the person who asked — a chat client renders nothing else there. A channel message
+is one message per turn however many deltas the turn streamed, so the answer is
+assembled and posted when the turn ends. Nothing else is: the tool calls, the
+reasoning and the acks stay off the channel, and a conversation that is not a
+Buzz channel still answers with an encrypted kind-`30078` envelope on
+`NOSTR_RELAYS`.
+
+The second kind is the NIP-OA agent profile (kind `10100`), which is what Buzz
+reads to know which pubkeys are agents, and
 which has to be signed by the agent's own key — something no operator can do by
 hand, because the `nsec` belongs to the gateway. It is replaceable, so it is
 published once, as soon as the relay has served a member list — that is what
@@ -199,10 +209,11 @@ channel: Buzz's channel UI is how an agent gets added to one, so an agent
 waiting to be a member to be registered is an agent that can never join.
 
 
-**Inbound otherwise.** Answers keep going out as encrypted kind-`30078` envelopes
-to the sender's key on `NOSTR_RELAYS`; no channel traffic is ever published to a
-Buzz relay, so a Buzz client will not show the agent's replies, and a permission
-request raised by a mention cannot be approved from Buzz.
+**Inbound otherwise.** A permission
+request raised by a mention is posted into the channel so the reader can see it,
+but it cannot be answered there: a reply in a channel is a prompt, not a
+`permission_response`, so approving still needs `POST /v1/messages` with
+`"type": "permission_response"`, or a client that speaks the envelope protocol.
 
 ```json
 {
@@ -262,7 +273,7 @@ and `hub.emit` (outbound):
 | `hub.go` | Routing, allow list, fan-out to subscribers and transports |
 | `sessions.go` | conversation ↔ OpenCode session mapping |
 | `nostr.go` | Nostr transport: subscribe, decrypt, publish |
-| `buzz.go` | Buzz channels: discover, subscribe, turn a mention into a prompt |
+| `buzz.go` | Buzz channels: discover, subscribe, mention to prompt, prompt to channel message |
 | `http.go` | `POST /v1/messages`, SSE stream, bearer auth, `/v1/chat/completions` |
 | `registry.go` | Agent config, keys, per-peer NIP-44 key cache |
 
@@ -275,9 +286,13 @@ republishes under its own protocol.
   dedupe state; agents start fresh conversations. Persist the map if that matters.
 - The Nostr subscription only looks 5 seconds back, so a gateway restart misses
   messages sent while it was down. Same for a Buzz channel subscription.
-- Buzz is inbound apart from the agent profile: replies and permission approvals
-  are not posted back into a channel, and mentions sent as Buzz's rich-content
-  kind (`40002`) rather than kind `9` are not seen.
+- Buzz carries the answer back as a kind `9` in the channel, but only the answer:
+  tool calls, reasoning and progress are not posted. A permission request raised
+  by a mention is posted and cannot be answered from the channel.
+- Mentions sent as Buzz's rich-content kind (`40002`) rather than kind `9` are not
+  seen. Neither is a message that arrives between one membership rediscovery and
+  the next: a channel the agent has just joined only starts delivering on the
+  subscription that named it.
 - A channel the agent is added to is picked up within a minute; a channel it is
   removed from keeps its conversation until the next rediscovery. A discovery
   query itself is capped at 15 seconds, so an unresponsive Buzz relay delays the
@@ -318,7 +333,9 @@ turn's answer), protocol version
 and body-size rejection, an oversized event surviving the stream, the allow list
 on the Nostr path, HTTP being unable to redirect Nostr replies, registry
 loading and key normalisation from env, a Buzz mention and a Buzz DM reaching
-OpenCode (and group chatter not reaching it) with one session per channel, a Buzz
+OpenCode (and group chatter not reaching it) with one session per channel, a
+streamed answer assembled into one kind-9 channel message with nothing published
+to `NOSTR_RELAYS`, the agent not answering its own channel replies, a Buzz
 discovery recovering from a refused NIP-42 handshake, a Buzz discovery on a relay
 that is also a `NOSTR_RELAYS` entry, the agent profile published before the agent
 is in any channel, and a full Nostr round trip

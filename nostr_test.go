@@ -53,8 +53,9 @@ type fakeRelay struct {
 	// state by querying (the Buzz channel list) needs it.
 	store     bool
 	stored    []*nostr.Event
-	published []int // kinds the gateway pushed here, as opposed to broadcast
-	opened    int   // websocket connections ever accepted
+	published []int          // kinds the gateway pushed here, as opposed to broadcast
+	posts     []*nostr.Event // the same events, whole, for tag and content assertions
+	opened    int            // websocket connections ever accepted
 }
 
 type relayConn struct {
@@ -182,6 +183,8 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 			}
 			r.mu.Lock()
 			r.published = append(r.published, ev.Kind)
+			post := ev
+			r.posts = append(r.posts, &post)
 			r.mu.Unlock()
 			c.write([]any{"OK", ev.ID, true, ""})
 			r.broadcast(&ev, c)
@@ -295,6 +298,13 @@ func (r *fakeRelay) publishKinds() []int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return slices.Clone(r.published)
+}
+
+// postsOf returns the events of one kind the gateway pushed here, whole.
+func (r *fakeRelay) postsOf(kind int) []*nostr.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.DeleteFunc(slices.Clone(r.posts), func(e *nostr.Event) bool { return e.Kind != kind })
 }
 
 func (r *fakeRelay) authCount() int {
@@ -719,12 +729,116 @@ func TestBuzzMentionsAndDMsReachOpenCode(t *testing.T) {
 		}
 	}
 
-	// The only thing that crosses to the Buzz relay is the agent profile that
-	// makes it show up as an agent there. The answers are kind-30078 envelopes
-	// for the sender's key on the normal relays, never kind-9 channel traffic.
+	// Nothing but the profile crosses to the Buzz relay when the agent has said
+	// nothing yet, and no envelope crosses the other way either: a channel
+	// conversation answers into the channel, not as a kind-30078.
 	if kinds := buzz.publishKinds(); !slices.Equal(kinds, []int{buzzProfileKind}) {
 		t.Fatalf("published %v to the buzz relay, want just [%d]", kinds, buzzProfileKind)
 	}
+	if kinds := relay.publishKinds(); len(kinds) != 0 {
+		t.Fatalf("published %v for a buzz conversation, want nothing", kinds)
+	}
+}
+
+// A mention reached the agent, and a Buzz client shows nothing, because the
+// answer went out as a kind-30078 envelope on NOSTR_RELAYS — a kind Buzz does not
+// render in a channel. The answer to a channel message is channel traffic: a
+// kind-9 in the same channel, signed by the agent, one message per turn however
+// many deltas the turn streamed.
+func TestBuzzAnswerIsPostedBackIntoTheChannel(t *testing.T) {
+	f := newFakeOC(t)
+	relay := newFakeRelay(t)
+	buzz := newFakeRelay(t)
+	buzz.requireAuth = true
+	buzz.store = true
+
+	usk := nostr.GeneratePrivateKey()
+	ask := nostr.GeneratePrivateKey()
+	apk, _ := nostr.GetPublicKey(ask)
+	agent := &Agent{Name: "frontend-agent", OpenCode: f.URL, PubKey: apk, sk: ask, ck: map[string][32]byte{}}
+	reg := &Registry{byName: map[string]*Agent{agent.Name: agent}}
+
+	// A DM: the human and the agent, which is the shape the report was about.
+	dm := "channel-dm-out"
+	buzz.inject(buzzMembers(t, usk, apk, dm, 2))
+	buzz.inject(buzzMessage(t, usk, dm, "", "@frontend-agent hello"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, []string{buzz.url()}, reg, h, log)
+	h.nostr = nt
+	go h.run(ctx)
+	go nt.run(ctx)
+
+	waitFor(t, "the mention to reach OpenCode", func() bool { _, p, _ := f.counts(); return p == 1 })
+
+	// The answer streams in as deltas, so the gateway has to assemble it rather
+	// than post one message per delta.
+	part := func(delta string) {
+		f.push("message.part.updated", map[string]any{
+			"sessionID": "ses_1", "delta": delta,
+			"part": map[string]any{"id": "prt_1", "type": "text", "sessionID": "ses_1"},
+		})
+	}
+	part("on it, ")
+	part("one sec")
+	f.push("session.idle", map[string]any{"sessionID": "ses_1"})
+
+	waitFor(t, "the answer to reach the buzz relay", func() bool {
+		return len(buzz.postsOf(buzzChatKind)) == 1
+	})
+	post := buzz.postsOf(buzzChatKind)[0]
+	if post.Content != "on it, one sec" {
+		t.Fatalf("posted %q, want the whole turn in one message", post.Content)
+	}
+	if post.PubKey != apk {
+		t.Fatalf("posted by %s, want the agent's own key %s", shortPub(post.PubKey), shortPub(apk))
+	}
+	if channel := post.Tags.Find("h").Value(); channel != dm {
+		t.Fatalf("h tag %q, want channel %q", channel, dm)
+	}
+	upk, _ := nostr.GetPublicKey(usk)
+	if !post.Tags.ContainsAny("p", []string{upk}) {
+		t.Fatalf("no p tag for the person who asked: %v", post.Tags)
+	}
+	// A kind-30078 envelope for the same conversation would be the old, invisible
+	// answer, and it would also land in the same relay as a read-state event.
+	if kinds := relay.publishKinds(); len(kinds) != 0 {
+		t.Fatalf("published %v to the message relays, want nothing", kinds)
+	}
+	if kinds := buzz.publishKinds(); !slices.Equal(kinds, []int{buzzProfileKind, buzzChatKind}) {
+		t.Fatalf("published %v to the buzz relay, want the profile then the answer", kinds)
+	}
+}
+
+// A relay fans an event out to the connection that published it, so the agent's
+// own answer comes back on its own channel subscription. In a DM every message
+// counts as addressed to the agent, so without the self-check the agent answers
+// itself once per answer.
+func TestBuzzIgnoresItsOwnChannelReplies(t *testing.T) {
+	f := newFakeOC(t)
+	usk := nostr.GeneratePrivateKey()
+	ask := nostr.GeneratePrivateKey()
+	apk, _ := nostr.GetPublicKey(ask)
+	agent := &Agent{Name: "frontend-agent", OpenCode: f.URL, PubKey: apk, sk: ask, ck: map[string][32]byte{}}
+	reg := &Registry{byName: map[string]*Agent{agent.Name: agent}}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	nt := newNostrTransport(context.Background(), nil, nil, reg, h, log)
+
+	// The agent's own kind-9, in a two-member channel, addressed to the agent.
+	own := buzzMessage(t, ask, "channel-dm", apk, "the agent's own answer")
+	nt.buzzReceive(context.Background(), agent, own, buzzChannels{"channel-dm": 2})
+	if _, p, _ := f.counts(); p != 0 {
+		t.Fatal("the agent prompted itself on its own channel reply")
+	}
+	// The same message from the human is still a prompt.
+	nt.buzzReceive(context.Background(), agent, buzzMessage(t, usk, "channel-dm", "", "hello"),
+		buzzChannels{"channel-dm": 2})
+	waitFor(t, "the human's message to reach OpenCode", func() bool { _, p, _ := f.counts(); return p == 1 })
 }
 
 // go-nostr keys its NIP-42 OK waiters by event id, so two auth events built in

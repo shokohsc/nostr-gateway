@@ -50,18 +50,36 @@ OpenCode session once, atomically) → `opencodeClient.promptAsync` → SSE from
 `opencodeClient.events` → `hub.onEvent` → `reduceEvent` → `hub.emit` → subscribers
 (SSE) + the Nostr publish queue.
 
-`buzz.go` is a transport like `nostr.go`, and it is subscribe-only with exactly one
-exception: the NIP-OA agent profile (kind `10100`), published once per agent to
-`BUZZ_RELAYS` so Buzz knows the pubkey is an agent. It must stay signed by the
-agent's own key, kind `10100` must not grow any channel traffic in its content,
-and `buzzProfile` must keep firing on a member list that names no channel — Buzz's
-channel UI is how an agent gets added to a channel, so an agent that waits to be a
-member to be registered is an agent that can never join.
-Apart from the profile, nothing is published to a Buzz relay, because a
-kind-30078 envelope stored on a Buzz relay surfaces in Buzz's own read-state view,
-and posting kind-9 answers back into a channel is not built yet. Inbound is
-unchanged — a mention becomes a prompt through `hub.Handle`, so `allow`, the lock
-order and one-session-per-conversation all still hold.
+`buzz.go` is a transport like `nostr.go`, and it is the one place that both reads
+and writes Buzz. It publishes two things and no more: the NIP-OA agent profile
+(kind `10100`), once per agent, so Buzz knows the pubkey is an agent, and the
+agent's answers, as kind `9` in the channel the mention came from. The profile
+must stay signed by the agent's own key, kind `10100` must not grow any channel
+traffic in its content, and `buzzProfile` must keep firing on a member list that
+names no channel — Buzz's channel UI is how an agent gets added to a channel, so
+an agent that waits to be a member to be registered is an agent that can never
+join.
+Inbound is unchanged — a mention becomes a prompt through `hub.Handle`, so
+`allow`, the lock order and one-session-per-conversation all still hold.
+
+The route out is the conversation id, not the hub: `buzzConvPrefix` marks a
+conversation as a channel, and `nostr.send` branches on it. `hub` stays
+transport-blind, so **if a second transport ever needs its own outbound path it
+gets its own conversation-id prefix, not a field on the hub.** A kind-30078
+envelope is what a Nostr subscriber renders, and Buzz renders kind 9, so the
+wrong kind in a channel is a silent no-op — the agent answers and the human sees
+nothing, which is the failure this whole path exists to prevent.
+
+`buzzJob` assembles a turn and posts it once, because a channel message is one
+message: OpenCode streams the answer as deltas and posting each one would put a
+message per token in front of the reader. It therefore runs on the `worker`
+goroutine, which is its only writer — that is why `nostr.turns` needs no lock and
+why `send` may not publish a channel message from its own goroutine. A turn that
+never reaches `completed` posts nothing; a debounce is the upgrade if that
+matters. `buzzReceive` drops events authored by the agent's own key, because a
+relay fans an event out to the connection that published it, and in a DM every
+message counts as addressed to the agent — without that check the agent answers
+itself once per answer.
 
 `buzzDiscover` is a one-shot `FetchMany`, and go-nostr never re-sends the REQ when
 its NIP-42 handshake comes back empty: it answers the challenge once and returns
