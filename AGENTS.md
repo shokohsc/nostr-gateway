@@ -43,13 +43,26 @@ OpenCode session once, atomically) → `opencodeClient.promptAsync` → SSE from
 `opencodeClient.events` → `hub.onEvent` → `reduceEvent` → `hub.emit` → subscribers
 (SSE) + the Nostr publish queue.
 
-`buzz.go` is a transport like `nostr.go`, and it is subscribe-only on purpose.
-Buzz relays come from `BUZZ_RELAYS` and are never in `NOSTR_RELAYS`: nothing is
-published to them, because a kind-30078 envelope stored on a Buzz relay surfaces
-in Buzz's own read-state view, and posting kind-9 answers back into a channel is
-not built yet. Inbound is unchanged — a mention becomes a prompt through
-`hub.Handle`, so `allow`, the lock order and one-session-per-conversation all
-still hold.
+`buzz.go` is a transport like `nostr.go`, and it is subscribe-only with exactly one
+exception: the NIP-OA agent profile (kind `10100`), published once per agent to
+`BUZZ_RELAYS` so Buzz knows the pubkey is an agent. It must stay signed by the
+agent's own key, after a discovery that proved the connection passed NIP-42, and
+kind `10100` must not grow any channel traffic in its content. Buzz relays are
+never in `NOSTR_RELAYS` and nothing else is published to them, because a
+kind-30078 envelope stored on a Buzz relay surfaces in Buzz's own read-state view,
+and posting kind-9 answers back into a channel is not built yet. Inbound is
+unchanged — a mention becomes a prompt through `hub.Handle`, so `allow`, the lock
+order and one-session-per-conversation all still hold.
+
+`buzzDiscover` is a one-shot `FetchMany`, and go-nostr never re-sends the REQ when
+its NIP-42 handshake comes back empty: it answers the challenge once and returns
+(pool.go:662-673). Combined with the identical-auth-event note above, that turns
+"the relay sent nothing" into a 60-second wait in the old code. Discovery is
+therefore bounded (`buzzFetchTimeout`), re-asked once on an empty answer
+(`buzzRetryDelay`), and only an empty *second* answer is logged as "agent is in no
+channel yet". Keep that distinction — a discovery query is the one call in the
+gateway whose failure mode is silence, so anything that swallows its result makes
+the agent deaf with nothing in the log.
 
 ## Security invariants — break these and it is a vulnerability, not a style nit
 
