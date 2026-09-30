@@ -330,6 +330,14 @@ func (n *nostrTransport) buzzReceive(ctx context.Context, a *Agent, ev *nostr.Ev
 	if npub, err := nip19.EncodePublicKey(ev.PubKey); err == nil {
 		in.Sender = npub
 	}
+	// The one inbound path that used to log nothing. Every refusal above and in
+	// drop says why a message did not become a prompt, so "the relay delivered
+	// nothing" and "the gateway got it and threw it away" were only separable by
+	// the agent's own publish in the relay log — which an unanswered turn never
+	// produces. Debug, because this fires once per inbound message.
+	n.log.Debug("buzz: inbound channel message",
+		"agent", a.Name, "from", shortPub(ev.PubKey), "channel", channel,
+		"members", members, "bytes", len(text))
 	if _, err := n.hub.Handle(ctx, a, in, ev.PubKey); err != nil {
 		// Nowhere to answer on a transport of its own: a rejected message still
 		// has to come back, or the sender cannot tell it apart from a lost relay
