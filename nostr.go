@@ -206,6 +206,7 @@ func (n *nostrTransport) receive(ctx context.Context, a *Agent, ev *nostr.Event)
 	// The allow list is checked before any key work, so a blocked sender costs
 	// nothing beyond the frame the relay already delivered.
 	if !a.allows(ev.PubKey) {
+		n.drop(a, ev, "sender is not on the allow list")
 		return nil
 	}
 	ck, err := a.conversationKey(ev.PubKey)

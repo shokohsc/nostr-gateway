@@ -283,20 +283,24 @@ func (n *nostrTransport) buzzReceive(ctx context.Context, a *Agent, ev *nostr.Ev
 		return
 	}
 	if !a.allows(ev.PubKey) {
+		n.drop(a, ev, "sender is not on the allow list")
 		return
 	}
 	channel := ev.Tags.Find("h").Value()
 	members, member := chans[channel]
 	if !member {
+		n.drop(a, ev, "not a channel the agent is in")
 		return // not a channel the agent is in
 	}
 	// In a two-member channel every message is addressed to the agent, which is
 	// what a DM is; in a group only a p tag for the agent is.
 	if !ev.Tags.ContainsAny("p", []string{a.PubKey}) && members > buzzDMMembers {
+		n.drop(a, ev, fmt.Sprintf("no p tag for the agent in a channel of %d members", members))
 		return
 	}
 	text := strings.TrimSpace(ev.Content)
 	if text == "" {
+		n.drop(a, ev, "empty message")
 		return
 	}
 	in := Envelope{
@@ -318,6 +322,19 @@ func (n *nostrTransport) buzzReceive(ctx context.Context, a *Agent, ev *nostr.Ev
 			Payload: Payload{Error: err.Error(), Text: err.Error()},
 		})
 	}
+}
+
+// drop is what an inbound message that never became a prompt logs. Both
+// transports refuse messages before they are prompts — buzzReceive four ways,
+// nostr.receive on the allow list — and a refusal is silent by default, so a
+// configuration fault looks exactly like an agent that is ignoring its
+// senders. A stale allow list is the usual one, because a Buzz client mints its
+// key in the browser and a new browser is a new pubkey. Debug is the right
+// level: a group channel refuses most of what it carries, and the homelab
+// deployment runs LOG_LEVEL=debug anyway.
+func (n *nostrTransport) drop(a *Agent, ev *nostr.Event, why string) {
+	n.log.Debug("inbound message not for this agent",
+		"agent", a.Name, "from", shortPub(ev.PubKey), "why", why)
 }
 
 // buzzJob folds one protocol event into what the channel will get. A channel
