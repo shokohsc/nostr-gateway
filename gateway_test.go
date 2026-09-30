@@ -356,6 +356,16 @@ func TestLoadRegistry(t *testing.T) {
 	if _, err := loadRegistry(); err == nil {
 		t.Fatal("a malformed npub must be rejected, not silently deaf")
 	}
+	// A well-formed pair that disagrees is the config error that used to pass
+	// every shape check and leave the agent deaf: the relay authenticates the
+	// connection as the nsec's key while every p-tag filter asks about the
+	// npub, so discovery comes back with no member lists and the log blames the
+	// relay. It has to be a startup error that names the key that disagrees.
+	t.Setenv("AGENTS", fmt.Sprintf(`{"agent-c":{"opencode":"http://x:4096","npub":%q,"nsec_env":"AGENT_A_NSEC"}}`, strings.Repeat("cd", 32)))
+	_, err = loadRegistry()
+	if err == nil || !strings.Contains(err.Error(), "AGENT_A_NSEC") {
+		t.Fatalf("an npub that is not the nsec's pubkey must be a startup error, got %v", err)
+	}
 }
 
 func TestReduceEvent(t *testing.T) {
