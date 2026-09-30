@@ -210,6 +210,31 @@ func TestPromptFlowOverHTTP(t *testing.T) {
 	}
 }
 
+func TestPromptAsyncSendsModelAsObject(t *testing.T) {
+	f := newFakeOC(t)
+	c := newOpencodeClient(f.URL, "", "")
+	if err := c.promptAsync(context.Background(), "ses_1", "hi", "opencode/big-pickle", "build"); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	prompts := append([]map[string]any(nil), f.prompts...)
+	f.mu.Unlock()
+	if len(prompts) != 1 {
+		t.Fatalf("prompts=%d, want 1", len(prompts))
+	}
+	// prompt_async validates model as an object, so the "provider/model" string
+	// the config and the README use has to be split on the way out. Sent as a
+	// string it is a 400 on every single message, reported back into the chat as
+	// a gateway error envelope.
+	ref, ok := prompts[0]["model"].(map[string]any)
+	if !ok || ref["providerID"] != "opencode" || ref["modelID"] != "big-pickle" {
+		t.Fatalf("model went out as %#v", prompts[0]["model"])
+	}
+	if prompts[0]["agent"] != "build" {
+		t.Fatalf("agent went out as %#v", prompts[0]["agent"])
+	}
+}
+
 func TestPermissionApprovalLoop(t *testing.T) {
 	f := newFakeOC(t)
 	h, srv := testHub(t, testRegistry(t, f.URL))
@@ -520,6 +545,13 @@ func TestLoadRegistry(t *testing.T) {
 	_, err = loadRegistry()
 	if err == nil || !strings.Contains(err.Error(), "AGENT_A_NSEC") {
 		t.Fatalf("an npub that is not the nsec's pubkey must be a startup error, got %v", err)
+	}
+	// prompt_async takes {"providerID","modelID"} and rejects a bare string, so
+	// a model without a slash cannot be turned into a reference at all. Say so
+	// at startup rather than once per message.
+	t.Setenv("AGENTS", `{"agent-d":{"opencode":"http://x:4096","npub":"`+pk+`","model":"big-pickle"}}`)
+	if _, err := loadRegistry(); err == nil || !strings.Contains(err.Error(), "provider/model") {
+		t.Fatalf("a model with no provider must be a startup error, got %v", err)
 	}
 }
 

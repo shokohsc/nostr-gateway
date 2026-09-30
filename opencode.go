@@ -139,7 +139,13 @@ func (c *opencodeClient) promptAsync(ctx context.Context, sessionID, text, model
 		"parts": []map[string]string{{"type": "text", "text": text}},
 	}
 	if model != "" {
-		body["model"] = model
+		// OpenCode's prompt_async takes a model reference object, not the
+		// "provider/model" string the config and the docs use. Sending the
+		// string is a 400 on every single message:
+		// `Expected object | null, got "opencode/big-pickle" at ["model"]`,
+		// which lands back in the chat as a gateway error envelope.
+		provider, id, _ := strings.Cut(model, "/")
+		body["model"] = map[string]string{"providerID": provider, "modelID": id}
 	}
 	if agent != "" {
 		body["agent"] = agent

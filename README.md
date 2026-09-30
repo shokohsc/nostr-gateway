@@ -240,6 +240,10 @@ every p-tag filter asks about the npub. That mismatch is otherwise silent — no
 member lists, no kind-`30078` answers, and nothing in the log but the relay
 being blamed for it.
 
+`model` is written `"provider/model"` and split in two on the way out:
+`prompt_async` takes `{"providerID":…,"modelID":…}`, so a model with no slash in
+it is a startup error rather than a `400` on every message.
+
 `allow` is a **Nostr** gate. On the Nostr path identity is the pubkey on the
 event signature — never the envelope's `sender` field, which is ignored — so a
 blocked sender is dropped before any decryption happens. HTTP callers carry no

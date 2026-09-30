@@ -27,6 +27,7 @@ type Agent struct {
 	// Allow lists the hex pubkeys allowed to talk to this agent. Empty = anyone.
 	Allow []string `json:"allow"`
 	// Model and OpencodeAgent are optional overrides passed to prompt_async.
+	// Model is "provider/model", split in two for the wire (see promptAsync).
 	Model         string `json:"model"`
 	OpencodeAgent string `json:"opencode_agent"`
 
@@ -82,6 +83,15 @@ func loadRegistry() (*Registry, error) {
 	for name, a := range cfg {
 		if a.OpenCode == "" {
 			return nil, fmt.Errorf("agent %q: missing opencode url", name)
+		}
+		if a.Model != "" {
+			// "provider/model", because that is the form every OpenCode
+			// config and this one's README use. prompt_async wants the two
+			// halves as an object, and a string with no slash in it turns into
+			// a 400 on every message instead of an error here.
+			if provider, id, ok := strings.Cut(a.Model, "/"); !ok || provider == "" || id == "" {
+				return nil, fmt.Errorf("agent %q: model %q is not \"provider/model\"", name, a.Model)
+			}
 		}
 		pub, err := decodeKey(a.PubKey)
 		if err != nil {
