@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 
@@ -841,7 +842,52 @@ func TestBuzzIgnoresItsOwnChannelReplies(t *testing.T) {
 	waitFor(t, "the human's message to reach OpenCode", func() bool { _, p, _ := f.counts(); return p == 1 })
 }
 
-// go-nostr keys its NIP-42 OK waiters by event id, so two auth events built in
+// A message the relay delivers but the gateway refuses must say so at Warn,
+// naming the pubkey or the channel and what to change: this failure looks
+// exactly like an agent ignoring its sender, and all four refusals logged at
+// Debug, so a configuration fault was indistinguishable from a quiet channel.
+// Only the two configuration faults are Warn — a group channel refuses most of
+// what it carries, and a Warn per group message would be noise.
+func TestBuzzRefusalsNameTheFault(t *testing.T) {
+	usk := nostr.GeneratePrivateKey()
+	upk, _ := nostr.GetPublicKey(usk)
+	stranger := nostr.GeneratePrivateKey()
+	spk, _ := nostr.GetPublicKey(stranger)
+	ask := nostr.GeneratePrivateKey()
+	apk, _ := nostr.GetPublicKey(ask)
+	agent := &Agent{Name: "frontend-agent", PubKey: apk, sk: ask,
+		Allow: []string{upk}, ck: map[string][32]byte{}}
+	reg := &Registry{byName: map[string]*Agent{agent.Name: agent}}
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	nt := newNostrTransport(context.Background(), nil, nil, reg, newHub(reg, log), log)
+	chans := buzzChannels{"channel-dm": 2, "channel-group": 5}
+
+	nt.buzzReceive(context.Background(), agent,
+		buzzMessage(t, stranger, "channel-dm", "", "hi"), chans)
+	nt.buzzReceive(context.Background(), agent,
+		buzzMessage(t, usk, "channel-elsewhere", "", "hi"), chans)
+	// A group message with no mention is not a fault, and must stay quiet.
+	nt.buzzReceive(context.Background(), agent,
+		buzzMessage(t, usk, "channel-group", "", "hi"), chans)
+
+	for _, want := range []string{
+		"level=WARN msg=\"buzz: inbound message from a pubkey the agent does not allow\"",
+		"from=" + shortPub(spk),
+		"msg=\"buzz: inbound message in a channel the agent is not in\"",
+		"channel=channel-elsewhere in=channel-dm,channel-group",
+		"level=DEBUG msg=\"inbound message not for this agent\"",
+	} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("log is missing %q:\n%s", want, buf.String())
+		}
+	}
+	if n := strings.Count(buf.String(), "level=WARN"); n != 2 {
+		t.Errorf("got %d warnings, want the 2 configuration faults:\n%s", n, buf.String())
+	}
+}
+
 // the same second collide and the loser of the pair gets nothing back — and the
 // one-shot REQ that asked for it is never sent again. With NOSTR_RELAYS and
 // BUZZ_RELAYS naming the same relay that is a guaranteed race at startup, so the
