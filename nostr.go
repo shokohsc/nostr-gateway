@@ -25,12 +25,16 @@ const messageKind = 30078
 type nostrTransport struct {
 	pools  map[string]*nostr.SimplePool
 	relays []string
-	// buzzRelays are subscribed to and never published to; see buzz.go.
+	// buzzRelays are subscribed to and never published to, apart from the
+	// agent profile; see buzz.go.
 	buzzRelays []string
-	reg        *Registry
-	hub        *hub
-	log        *slog.Logger
-	out        chan job
+	// profiled remembers which agents have published their Buzz agent profile.
+	// One writer per key — that agent's buzzListen goroutine.
+	profiled map[string]bool
+	reg      *Registry
+	hub      *hub
+	log      *slog.Logger
+	out      chan job
 }
 
 type job struct {
@@ -48,6 +52,7 @@ func newNostrTransport(ctx context.Context, relays, buzzRelays []string, reg *Re
 		pools:      map[string]*nostr.SimplePool{},
 		relays:     relays,
 		buzzRelays: buzzRelays,
+		profiled:   map[string]bool{},
 		reg:        reg,
 		hub:        h,
 		log:        log,

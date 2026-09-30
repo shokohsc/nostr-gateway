@@ -18,14 +18,20 @@ import (
 // messages when it names that channel in #h — the agent's channels have to be
 // discovered before it can hear anything.
 //
-// This is inbound only. Answers still go out the way they always have: NIP-44
-// encrypted kind-30078 envelopes to the sender's key on NOSTR_RELAYS. Posting
-// back into a Buzz channel is a separate feature (kind 9, the same h tag, no
-// encryption) and is deliberately not here, so the Buzz relays are subscribed to
-// and never published to.
+// This is inbound, except for one thing: the NIP-OA agent profile (buzzProfileKind)
+// that tells Buzz which pubkeys are agents. The gateway holds the agent's nsec, so
+// it is the only party that can sign that profile at all. Answers still go out the
+// way they always have: NIP-44 encrypted kind-30078 envelopes to the sender's key
+// on NOSTR_RELAYS. Posting back into a Buzz channel is a separate feature (kind 9,
+// the same h tag, no encryption) and is deliberately not here, so no channel
+// traffic is ever published to a Buzz relay.
 const (
 	buzzChatKind   = 9     // NIP-29 message: #h = channel uuid, p = mention
 	buzzMemberKind = 39002 // NIP-29 member list: d = channel uuid, p = every member
+	// buzzProfileKind is the NIP-OA agent profile Buzz reads to tell an agent
+	// apart from a person, and the only thing the gateway publishes to a Buzz
+	// relay. Replaceable (10000-19999), so one event per author is enough.
+	buzzProfileKind = 10100
 	// buzzDMMembers is what makes a channel a DM: the agent and one other person.
 	buzzDMMembers = 2
 	// buzzRefresh re-reads the member lists, so a channel the agent joined after
@@ -33,6 +39,19 @@ const (
 	// ponytail: a timer per agent; a kind-44100 subscription ("member added",
 	// p-gated to our own pubkey) is the upgrade if joins have to be instant.
 	buzzRefresh = time.Minute
+	// buzzFetchTimeout caps one discovery query. FetchMany is a one-shot REQ that
+	// ends at EOSE, so a relay that stops answering would otherwise leave the
+	// agent deaf with no log line at all.
+	buzzFetchTimeout = 15 * time.Second
+	// buzzRetryDelay is how long to wait before asking a relay that answered a
+	// discovery with no member lists whatsoever. No rosters at all is not the
+	// same answer as "no membership": go-nostr keys its NIP-42 OK waiters by
+	// event id, so when two subscriptions on one connection answer the same
+	// challenge in the same second one of them gets nothing back — and the
+	// one-shot REQ is never sent again (pool.go:662-673). Asking a second time
+	// on an already-authenticated connection costs a second and means the race
+	// cannot leave the agent deaf for a whole refresh interval.
+	buzzRetryDelay = 3 * time.Second
 )
 
 // buzzChannels maps a channel uuid to the member count its member list carried,
@@ -48,13 +67,16 @@ func buzzConversation(channel string) string { return "buzz-" + channel }
 // list per channel, and the agent's own pubkey on it means the agent is a
 // member, so a single filter fetches them all. FetchMany is a one-shot REQ that
 // ends at EOSE and answers a NIP-42 challenge on the way, so a closed relay
-// works here exactly as it does for the kind-30078 subscription.
+// works here exactly as it does for the kind-30078 subscription. The timeout is
+// the point: this is the one call in the gateway whose failure mode is silence.
 func (n *nostrTransport) buzzDiscover(ctx context.Context, a *Agent) buzzChannels {
+	ctx, cancel := context.WithTimeout(ctx, buzzFetchTimeout)
+	defer cancel()
 	chans := buzzChannels{}
 	filter := nostr.Filter{Kinds: []int{buzzMemberKind}, Tags: nostr.TagMap{"p": []string{a.PubKey}}}
 	for ie := range n.pools[a.Name].FetchMany(ctx, n.buzzRelays, filter) {
 		if ie.Event == nil {
-			continue // EOSE
+			continue // EOSE, or a subscription the relay closed
 		}
 		channel := ie.Event.Tags.GetD()
 		if channel == "" {
@@ -79,24 +101,36 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 	for ctx.Err() == nil {
 		connected := time.Now()
 		chans := n.buzzDiscover(ctx, a)
+		if len(chans) == 0 {
+			// A relay that returns no member lists at all has not really
+			// answered — see buzzRetryDelay. Ask again before believing it.
+			n.log.Warn("buzz: discovery came back with no member lists", "agent", a.Name, "relays", n.buzzRelays)
+			if !wait(ctx, buzzRetryDelay) {
+				return
+			}
+			chans = n.buzzDiscover(ctx, a)
+		}
 		ids := make([]string, 0, len(chans))
 		for id := range chans {
 			ids = append(ids, id)
 		}
 		slices.Sort(ids) // a stable filter, so the REQ does not reshuffle itself
-		if joined := strings.Join(ids, ","); joined != seen {
-			seen = joined
-			n.log.Info("buzz channels", "agent", a.Name, "channels", joined)
-		}
 		if len(ids) == 0 {
-			// No membership to listen to, and an empty #h is a filter no relay
-			// agrees on. This is a wait for a join, not a failed connection, so
-			// it does not back off.
-			n.log.Warn("buzz: agent is in no channel yet", "agent", a.Name)
+			// Now it is an answer: the relay has the agent's member lists and
+			// none of them name it. This is a wait for a join, not a failed
+			// connection, so it does not back off. Publishing the agent profile
+			// also waits for this point — it needs an authenticated connection.
+			n.log.Warn("buzz: agent is in no channel yet", "agent", a.Name,
+				"hint", "no kind-39002 member list on the relay names this pubkey: add it to a channel, then reconcile the rosters")
 			if !wait(ctx, buzzRefresh) {
 				return
 			}
 			continue
+		}
+		n.buzzProfile(ctx, a)
+		if joined := strings.Join(ids, ","); joined != seen {
+			seen = joined
+			n.log.Info("buzz channels", "agent", a.Name, "channels", joined)
 		}
 
 		filter := nostr.Filter{
@@ -143,6 +177,53 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 		}
 		interval = reconnectBase
 	}
+}
+
+// buzzProfile publishes the NIP-OA agent profile, once per agent per process,
+// the first time a Buzz relay has answered with a member list. Buzz derives an
+// agent's channel pills from these events (kind 10100), and without one the
+// agent is a member of the relay but invisible in the agent UI — which is the
+// one thing an operator cannot fix by hand, because the profile has to be
+// signed by the agent's own key and the gateway is the only holder of it.
+//
+// This is the single exception to "a Buzz relay is subscribed to, never
+// published to". It is safe because 10100 is replaceable (one event per author),
+// carries no channel traffic, and does not show up in Buzz's read-state view,
+// which is what that rule protects. The profile is only published after a
+// successful discovery, because that is what proves the connection passed
+// NIP-42 — a profile pushed onto an unauthenticated connection is simply
+// refused.
+func (n *nostrTransport) buzzProfile(ctx context.Context, a *Agent) {
+	// One writer per agent: buzzListen is the only caller, one goroutine each.
+	if n.profiled[a.Name] {
+		return
+	}
+	ev := nostr.Event{
+		Kind: buzzProfileKind, CreatedAt: nostr.Now(),
+		// Buzz parses the content as JSON and rejects the event outright
+		// without this field. It says who may add the agent to a channel, and
+		// "anyone" is the relay's own default, so publishing it changes nothing
+		// about who can add the agent.
+		// ponytail: the default policy; a config knob per agent if a deployment
+		// ever wants the agent to refuse channel additions.
+		Content: `{"channel_add_policy":"anyone"}`,
+	}
+	if err := ev.Sign(a.sk); err != nil {
+		n.log.Warn("buzz: agent profile not signed", "agent", a.Name, "err", err)
+		return
+	}
+	var firstErr error
+	for res := range n.pools[a.Name].PublishMany(ctx, n.buzzRelays, ev) {
+		if res.Error != nil && firstErr == nil {
+			firstErr = res.Error
+		}
+	}
+	if firstErr != nil {
+		n.log.Warn("buzz: agent profile not published, retrying with the next discovery", "agent", a.Name, "err", firstErr)
+		return
+	}
+	n.profiled[a.Name] = true
+	n.log.Info("buzz: published agent profile", "agent", a.Name, "kind", buzzProfileKind)
 }
 
 // buzzReceive decides whether one channel message is addressed to this agent and

@@ -41,13 +41,19 @@ type fakeRelay struct {
 	// any other event afterwards.
 	requireAuth bool
 	auths       int
+	// dropAuths refuses that many NIP-42 answers. A refused handshake is the
+	// fast stand-in for a lost one — either way go-nostr gives up on the
+	// subscription instead of sending the REQ again (pool.go:662-673) — and it
+	// is what a client sees when its auth event loses the race with another
+	// subscription's on the same connection.
+	dropAuths int
 	// store makes the relay answer a REQ with everything injected so far before
 	// its EOSE, like a real relay's stored events. It is off by default because
 	// the other tests only ever need live fan-out; a client that has to discover
 	// state by querying (the Buzz channel list) needs it.
 	store     bool
 	stored    []*nostr.Event
-	published int // events the gateway pushed here, as opposed to broadcast
+	published []int // kinds the gateway pushed here, as opposed to broadcast
 }
 
 type relayConn struct {
@@ -150,6 +156,18 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 			if json.Unmarshal(msg[1], &ev) != nil {
 				continue
 			}
+			r.mu.Lock()
+			drop := r.dropAuths > 0
+			if drop {
+				r.dropAuths--
+			}
+			r.mu.Unlock()
+			if drop {
+				// Refused before verify, so the connection stays unauthenticated
+				// and the client has to ask again from scratch.
+				c.write([]any{"OK", ev.ID, false, "auth-required: refused on purpose"})
+				continue
+			}
 			c.write([]any{"OK", ev.ID, r.verify(c, &ev), "auth-required: verification failed"})
 		case `"EVENT"`:
 			var ev nostr.Event
@@ -161,7 +179,7 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 				continue
 			}
 			r.mu.Lock()
-			r.published++
+			r.published = append(r.published, ev.Kind)
 			r.mu.Unlock()
 			c.write([]any{"OK", ev.ID, true, ""})
 			r.broadcast(&ev, c)
@@ -269,10 +287,12 @@ func (r *fakeRelay) subscribeCount() int {
 	return r.subs
 }
 
-func (r *fakeRelay) publishCount() int {
+// publishKinds returns the kinds the gateway pushed here, in order, so a test can
+// say which events crossed to the relay rather than only how many.
+func (r *fakeRelay) publishKinds() []int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.published
+	return slices.Clone(r.published)
 }
 
 func (r *fakeRelay) authCount() int {
@@ -689,10 +709,57 @@ func TestBuzzMentionsAndDMsReachOpenCode(t *testing.T) {
 		}
 	}
 
-	// The Buzz relays are subscribed to and nothing else: the agent's answers
-	// are kind-30078 envelopes for the sender's key on the normal relays.
-	if n := buzz.publishCount(); n != 0 {
-		t.Fatalf("published %d events to the buzz relay, want 0", n)
+	// The only thing that crosses to the Buzz relay is the agent profile that
+	// makes it show up as an agent there. The answers are kind-30078 envelopes
+	// for the sender's key on the normal relays, never kind-9 channel traffic.
+	if kinds := buzz.publishKinds(); !slices.Equal(kinds, []int{buzzProfileKind}) {
+		t.Fatalf("published %v to the buzz relay, want just [%d]", kinds, buzzProfileKind)
+	}
+}
+
+// go-nostr keys its NIP-42 OK waiters by event id, so two auth events built in
+// the same second collide and the loser of the pair gets nothing back — and the
+// one-shot REQ that asked for it is never sent again. With NOSTR_RELAYS and
+// BUZZ_RELAYS naming the same relay that is a guaranteed race at startup, so the
+// first Buzz discovery can come back empty while the agent is in several
+// channels. An empty answer has to be re-asked, not believed: the gateway used
+// to wait out the whole refresh interval on it and log "agent is in no channel
+// yet", which is a lie and leaves the agent deaf to every mention.
+func TestBuzzDiscoverySurvivesALostNIP42Handshake(t *testing.T) {
+	f := newFakeOC(t)
+	relay := newFakeRelay(t)
+	buzz := newFakeRelay(t)
+	buzz.requireAuth = true
+	buzz.store = true
+	buzz.dropAuths = 1 // the first handshake is refused, the second is not
+
+	usk := nostr.GeneratePrivateKey()
+	ask := nostr.GeneratePrivateKey()
+	apk, _ := nostr.GetPublicKey(ask)
+	agent := &Agent{Name: "frontend-agent", OpenCode: f.URL, PubKey: apk, sk: ask, ck: map[string][32]byte{}}
+	reg := &Registry{byName: map[string]*Agent{agent.Name: agent}}
+
+	group := "channel-after-retry"
+	buzz.inject(buzzMembers(t, usk, apk, group, 3))
+	buzz.inject(buzzMessage(t, usk, group, apk, "@frontend-agent did you get that?"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, []string{buzz.url()}, reg, h, log)
+	h.nostr = nt
+	go h.run(ctx)
+	go nt.run(ctx)
+
+	// The mention only arrives on a discovery that worked, so reaching OpenCode
+	// is proof the retry happened: the member list was there all along.
+	waitFor(t, "the mention after a refused handshake", func() bool { _, p, _ := f.counts(); return p == 1 })
+	if h.convs.get(buzzConversation(group)) == nil {
+		t.Fatal("the channel the agent is in has no conversation")
+	}
+	if kinds := buzz.publishKinds(); !slices.Equal(kinds, []int{buzzProfileKind}) {
+		t.Fatalf("published %v to the buzz relay, want just [%d]", kinds, buzzProfileKind)
 	}
 }
 

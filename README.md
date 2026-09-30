@@ -124,6 +124,11 @@ export BUZZ_RELAYS='ws://buzz.example.internal:3000'
   channel, so the agent's channels are discovered first, from the NIP-29 member
   lists (kind `39002`) the agent's own pubkey appears in. Membership is re-read
   every minute, so a channel the agent was added to later needs no restart.
+- A discovery that comes back with no member lists at all is re-asked a few
+  seconds later, because that is what a lost NIP-42 handshake looks like (see
+  `AGENTS.md`), not membership. Only a second empty answer is reported as
+  `buzz: agent is in no channel yet`, which means the relay has member lists and
+  none of them name the agent: add it to a channel, then reconcile the rosters.
 - A message is a prompt when it carries a `p` tag for the agent, or when it
   arrives in a two-member channel. Everything else in a group channel is
   ignored, and the `allow` list still applies.
@@ -134,10 +139,16 @@ export BUZZ_RELAYS='ws://buzz.example.internal:3000'
 - The agent's `npub` has to be a member of the Buzz relay
   (`buzz-admin add-member`) or the subscription is closed, same as above.
 
-**Inbound only.** Answers keep going out as encrypted kind-`30078` envelopes to
-the sender's key on `NOSTR_RELAYS`; the Buzz relays are subscribed to and never
-published to, so a Buzz client will not show the agent's replies, and a
-permission request raised by a mention cannot be approved from Buzz.
+**One thing is published to the Buzz relays**: the NIP-OA agent profile
+(kind `10100`), which is what Buzz reads to know which pubkeys are agents, and
+which has to be signed by the agent's own key — something no operator can do by
+hand, because the `nsec` belongs to the gateway. It is replaceable, so it is
+published once, after the relay has proved the connection passes NIP-42.
+
+**Inbound otherwise.** Answers keep going out as encrypted kind-`30078` envelopes
+to the sender's key on `NOSTR_RELAYS`; no channel traffic is ever published to a
+Buzz relay, so a Buzz client will not show the agent's replies, and a permission
+request raised by a mention cannot be approved from Buzz.
 
 ```json
 {
@@ -203,11 +214,13 @@ republishes under its own protocol.
   dedupe state; agents start fresh conversations. Persist the map if that matters.
 - The Nostr subscription only looks 5 seconds back, so a gateway restart misses
   messages sent while it was down. Same for a Buzz channel subscription.
-- Buzz is inbound only: replies and permission approvals are not posted back into
-  a channel, and mentions sent as Buzz's rich-content kind (`40002`) rather than
-  kind `9` are not seen.
+- Buzz is inbound apart from the agent profile: replies and permission approvals
+  are not posted back into a channel, and mentions sent as Buzz's rich-content
+  kind (`40002`) rather than kind `9` are not seen.
 - A channel the agent is added to is picked up within a minute; a channel it is
-  removed from keeps its conversation until the next rediscovery.
+  removed from keeps its conversation until the next rediscovery. A discovery
+  query itself is capped at 15 seconds, so an unresponsive Buzz relay delays the
+  agent rather than deafening it permanently.
 - `go test -race` skips `nostr_test.go`: go-nostr v0.52.3 has a data race in its
   own connect path (`Relay.ConnectWithTLS` writing `r.Connection` while
   `Relay.close` reads it, `relay.go:175` vs `relay.go:576`) that fires as soon as
@@ -231,7 +244,7 @@ reducer's delta/dedupe rules, replay for late SSE subscribers, protocol version
 and body-size rejection, an oversized event surviving the stream, the allow list
 on the Nostr path, HTTP being unable to redirect Nostr replies, registry
 loading and key normalisation from env, a Buzz mention and a Buzz DM reaching
-OpenCode (and group chatter not reaching it) with one session per channel, and a
-full Nostr round trip (NIP-44, kind, `p` tag routing, encrypted reply) against
-an in-process fake relay, including a relay that demands NIP-42 and
-authenticates each agent separately.
+OpenCode (and group chatter not reaching it) with one session per channel, a Buzz
+discovery recovering from a refused NIP-42 handshake, and a full Nostr round trip
+(NIP-44, kind, `p` tag routing, encrypted reply) against an in-process fake relay,
+including a relay that demands NIP-42 and authenticates each agent separately.
