@@ -178,6 +178,13 @@ Kubernetes Secret while this config stays in a ConfigMap. Keys are written as
 `npub1…`/`nsec1…` or hex; the registry normalises them to hex, and a malformed
 key is a startup error rather than an agent that silently hears nothing.
 
+`npub` and `nsec_env` are one identity, and the registry checks it: a well-formed
+npub that is not the pubkey of that private key is a startup error naming both
+keys, because the relay authenticates the connection as the nsec's key while
+every p-tag filter asks about the npub. That mismatch is otherwise silent — no
+member lists, no kind-`30078` answers, and nothing in the log but the relay
+being blamed for it.
+
 `allow` is a **Nostr** gate. On the Nostr path identity is the pubkey on the
 event signature — never the envelope's `sender` field, which is ignored — so a
 blocked sender is dropped before any decryption happens. HTTP callers carry no

@@ -90,6 +90,11 @@ that swallows its result makes the agent deaf with nothing in the log.
   reaching go-nostr produces a `p` tag filter that never matches a real relay —
   the agent goes silently deaf, with no error anywhere. `TestNostrRoutesByPTag`
   is the guard; it fails if this ever regresses.
+- `loadRegistry` also refuses an `npub` that is not the pubkey of its
+  `nsec_env`, naming both keys in the error. Same silence one step further
+  out: the relay authenticates the connection as the nsec's key while every
+  p-tag filter asks about the npub, so Buzz discovery returns no member lists
+  and the log blames the relay. `TestLoadRegistry` is the guard.
 - `sessionMap.lookup` intentionally does **not** set the reply peer. Setting it
   there let a request for another agent's conversation re-point that
   conversation's reply target before being rejected. Set the peer in `Handle`,

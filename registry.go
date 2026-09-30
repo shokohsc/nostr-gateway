@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
 	"github.com/nbd-wtf/go-nostr/nip44"
 )
@@ -97,6 +98,20 @@ func loadRegistry() (*Registry, error) {
 			}
 			if sk == "" {
 				return nil, fmt.Errorf("agent %q: %s is empty", name, a.NSecEnv)
+			}
+			// One identity, not two keys: every p-tag filter — the kind-30078
+			// answers and the Buzz member lists — asks the relay about
+			// a.PubKey, while the connection authenticates as whatever a.sk
+			// derives. A pair that disagrees is well formed and matches nothing
+			// the relay holds for us, so the agent hears nothing and the only
+			// log line blames the relay. Name both keys and stop.
+			derived, err := nostr.GetPublicKey(sk)
+			if err != nil {
+				return nil, fmt.Errorf("agent %q: %s: not a private key: %w", name, a.NSecEnv, err)
+			}
+			if derived != a.PubKey {
+				return nil, fmt.Errorf("agent %q: npub %s is not the pubkey of %s (that key is %s): every p-tag filter would ask about a key this agent does not own",
+					name, a.PubKey[:8], a.NSecEnv, derived[:8])
 			}
 			a.sk = sk
 		}
