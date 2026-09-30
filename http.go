@@ -20,6 +20,8 @@ func (h *hub) handler(token string) http.Handler {
 	})
 	mux.HandleFunc("POST /v1/messages", h.postMessage)
 	mux.HandleFunc("GET /v1/conversations/{id}/events", h.streamEvents)
+	mux.HandleFunc("GET /v1/models", h.listModels)
+	mux.HandleFunc("POST /v1/chat/completions", h.chatCompletions)
 	if token == "" {
 		return mux
 	}
@@ -101,6 +103,246 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// The OpenAI-compatible face: the same hub, the same conversations, the same
+// allow-list-free bearer token, only the wire format is the one every chat client
+// and every agent framework already speaks. It is a translation, not a second
+// agent: `model` names a registry agent, `user` scopes the conversation, and
+// everything after that is Handle + subscribe.
+const oaiModelPrefix = "opencode-nostr-gateway/"
+
+type oaiRequest struct {
+	Model    string `json:"model"`
+	User     string `json:"user"`
+	Stream   bool   `json:"stream"`
+	Messages []struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	} `json:"messages"`
+}
+
+// listModels is every registry agent, so a client's model picker is the agent
+// list. One entry per agent: the model is chosen by the agent's own config
+// (`model` / `opencode_agent`), not per request.
+func (h *hub) listModels(w http.ResponseWriter, r *http.Request) {
+	data := make([]map[string]any, 0, len(h.reg.byName))
+	for _, name := range h.reg.names() {
+		data = append(data, map[string]any{
+			"id": oaiModelPrefix + name, "object": "model", "owned_by": "opencode",
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+// chatCompletions turns an OpenAI chat request into a prompt and the answer back
+// into chat completions.
+//
+// The client sends the whole conversation every time, so only the last user
+// message is the prompt; everything before it is context the client already holds.
+// Which conversation this continues is `user`, since OpenAI has no id for it —
+// with no `user` every request is its own conversation, which is what a client
+// with no state should get.
+func (h *hub) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var in oaiRequest
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	name, ok := strings.CutPrefix(in.Model, oaiModelPrefix)
+	a := h.reg.byName[name]
+	if !ok || a == nil {
+		// An agent name alone is accepted too: the prefix exists to keep a client
+		// from mistaking one of these for a hosted model.
+		if a = h.reg.byName[in.Model]; a == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown model " + in.Model})
+			return
+		}
+	}
+	prompt := ""
+	for _, m := range in.Messages {
+		if strings.EqualFold(m.Role, "user") && strings.TrimSpace(m.Content) != "" {
+			prompt = m.Content
+		}
+	}
+	if prompt == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no user message"})
+		return
+	}
+	conv := "oai-" + newID("c")
+	if in.User != "" {
+		conv = "oai-" + in.User
+	}
+
+	// Subscribed before the prompt and cut at the ack: subscribe replays the
+	// conversation's history, which on a continued conversation is the previous
+	// turn's answer, and this response must not contain it. Handle emits the ack
+	// itself, so its id is an exact cursor with no timestamp to race.
+	ch, cancel := h.subscribe(conv)
+	defer cancel()
+	ack, err := h.Handle(r.Context(), a, Envelope{
+		Conversation: conv, Agent: a.Name, Type: TypeMessage, Payload: Payload{Text: prompt},
+	}, "")
+	if err != nil {
+		code := http.StatusBadGateway
+		if errors.Is(err, errInvalid) {
+			code = http.StatusBadRequest
+		}
+		writeJSON(w, code, map[string]string{"error": err.Error()})
+		return
+	}
+
+	if in.Stream {
+		h.streamCompletion(w, r, a, conv, ch, ack.ID)
+		return
+	}
+	text, failure := collectTurn(r.Context(), ch, ack.ID)
+	if failure != "" {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": failure})
+		return
+	}
+	writeJSON(w, http.StatusOK, completion(a, conv, text))
+}
+
+// streamCompletion is the same turn, chunk by chunk, in the SSE shape every
+// client already parses: a role delta first, then the deltas as they stream, and
+// `data: [DONE]` when the turn ends.
+func (h *hub) streamCompletion(w http.ResponseWriter, r *http.Request, a *Agent, conv string, ch <-chan Envelope, after string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming unsupported"})
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	send := func(delta string, done bool) bool {
+		chunk := completionChunk(a, conv, delta, done)
+		b, err := json.Marshal(chunk)
+		if err != nil {
+			return true
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+	if !send("", false) {
+		return
+	}
+	for env := range untilTurnEnd(r.Context(), ch, after) {
+		switch env.Type {
+		case TypeMessage:
+			if !send(env.Payload.Text, false) {
+				return
+			}
+		case TypeError:
+			// The turn ended badly, and a stream has no status code left to say
+			// so: the error goes in the content, then the stream ends.
+			send(env.Payload.Text, true)
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
+	}
+	send("", true)
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+// collectTurn joins one turn's text. Everything the protocol emits for a turn —
+// acks, tool calls, reasoning, progress — is not something an OpenAI client can
+// render, so only the answer text is joined; a permission request is the
+// exception, and it arrives as its own error because there is no way to ask for
+// one over this surface (see the Known limits in the README).
+func collectTurn(ctx context.Context, ch <-chan Envelope, after string) (string, string) {
+	var text strings.Builder
+	for env := range untilTurnEnd(ctx, ch, after) {
+		switch env.Type {
+		case TypeMessage:
+			text.WriteString(env.Payload.Text)
+		case TypeError, TypePermissionReq:
+			text.WriteString(env.Payload.Text)
+			return text.String(), env.Payload.Error
+		}
+	}
+	return text.String(), ""
+}
+
+// untilTurnEnd yields one turn's events, dropping the replayed history up to and
+// including the ack, and closing on completed, error or the client going away.
+// A client that hangs up mid-turn is normal, not an error, so this is where the
+// wait ends.
+func untilTurnEnd(ctx context.Context, ch <-chan Envelope, after string) <-chan Envelope {
+	out := make(chan Envelope)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case env, ok := <-ch:
+				if !ok {
+					return
+				}
+				if after != "" {
+					if env.ID == after {
+						after = "" // the turn starts here
+					}
+					continue
+				}
+				if env.Type == TypeCompleted || env.Type == TypeError {
+					return
+				}
+				select {
+				case out <- env:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out
+}
+
+func completion(a *Agent, conv, text string) map[string]any {
+	return map[string]any{
+		"id":      "chatcmpl-" + newID(""),
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   oaiModelPrefix + a.Name,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"message":       map[string]any{"role": "assistant", "content": text},
+			"finish_reason": "stop",
+		}},
+		"usage": map[string]any{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+		// The gateway's own id for the conversation, so a client that wants the
+		// envelope protocol or the SSE event stream can follow it from here.
+		"conversation": conv,
+	}
+}
+
+func completionChunk(a *Agent, conv, delta string, done bool) map[string]any {
+	choice := map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": nil}
+	if done {
+		choice["delta"] = map[string]any{}
+		choice["finish_reason"] = "stop"
+	} else if delta != "" {
+		choice["delta"] = map[string]any{"content": delta}
+	} else {
+		choice["delta"] = map[string]any{"role": "assistant"}
+	}
+	return map[string]any{
+		"id": "chatcmpl-" + newID(""), "object": "chat.completion.chunk",
+		"created": time.Now().Unix(), "model": oaiModelPrefix + a.Name,
+		"choices": []any{choice}, "conversation": conv,
+	}
 }
 
 func (h *hub) serveHTTP(ctx context.Context, addr, token string) error {

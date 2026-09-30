@@ -299,6 +299,161 @@ func TestHTTPAuthToken(t *testing.T) {
 // identity and cannot become one by asserting a sender, so the conversation
 // must not gain a Nostr peer (see TestNostrAllowList and the exfiltration test
 // in nostr_test.go for the Nostr side).
+// The OpenAI surface is the same hub behind a wire format every chat client
+// already speaks, so the point of the test is that the client gets its answer
+// back as a chat completion — and only this turn's, since a continued
+// conversation replays the previous answer into the new response otherwise.
+func TestOpenAIChatCompletions(t *testing.T) {
+	f := newFakeOC(t)
+	_, srv := testHub(t, testRegistry(t, f.URL))
+
+	// /v1/models has to name the agent, or a client cannot pick one.
+	resp, err := http.Get(srv.URL + "/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var models struct {
+		Data []struct{ ID string } `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&models); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(models.Data) != 1 || models.Data[0].ID != "opencode-nostr-gateway/frontend-agent" {
+		t.Fatalf("models %+v", models.Data)
+	}
+
+	// The fake names the sessions ses_1, ses_2, ... as it creates them, so the
+	// test says which session answers which user.
+	ask := func(user, session, question string) string {
+		t.Helper()
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			f.push("message.part.updated", map[string]any{
+				"sessionID": session, "delta": "answer to " + question,
+				"part": map[string]any{"id": "prt_1", "type": "text", "sessionID": session},
+			})
+			f.push("session.idle", map[string]any{"sessionID": session})
+		}()
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"opencode-nostr-gateway/frontend-agent","user":"`+user+
+				`","messages":[{"role":"user","content":"`+question+`"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		var out struct {
+			Object       string `json:"object"`
+			Conversation string `json:"conversation"`
+			Choices      []struct {
+				Message struct{ Role, Content string } `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		if out.Object != "chat.completion" || len(out.Choices) != 1 {
+			t.Fatalf("not a chat completion: %+v", out)
+		}
+		return out.Choices[0].Message.Content
+	}
+
+	// One OpenCode session for one user: the second turn continues the first.
+	if got := ask("alice", "ses_1", "one"); got != "answer to one" {
+		t.Fatalf("first turn %q", got)
+	}
+	if got := ask("alice", "ses_1", "two"); got != "answer to two" {
+		t.Fatalf("second turn carried the previous answer: %q", got)
+	}
+	if sessions, _, _ := f.counts(); sessions != 1 {
+		t.Fatalf("one user produced %d sessions", sessions)
+	}
+	// A different user is a different conversation, and therefore a new session.
+	if got := ask("bob", "ses_2", "hello"); got != "answer to hello" {
+		t.Fatalf("other user %q", got)
+	}
+	if sessions, _, _ := f.counts(); sessions != 2 {
+		t.Fatalf("two users produced %d sessions", sessions)
+	}
+}
+
+func TestOpenAIChatCompletionsStream(t *testing.T) {
+	f := newFakeOC(t)
+	_, srv := testHub(t, testRegistry(t, f.URL))
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		for _, d := range []string{"str", "eamed"} {
+			f.push("message.part.updated", map[string]any{
+				"sessionID": "ses_1", "delta": d,
+				"part": map[string]any{"id": "prt_1", "type": "text", "sessionID": "ses_1"},
+			})
+		}
+		f.push("session.idle", map[string]any{"sessionID": "ses_1"})
+	}()
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"opencode-nostr-gateway/frontend-agent","stream":true,`+
+			`"messages":[{"role":"user","content":"go"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("content type %q", ct)
+	}
+	var text strings.Builder
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		data, ok := strings.CutPrefix(strings.TrimSpace(line), "data: ")
+		if !ok || data == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Object  string `json:"object"`
+			Choices []struct {
+				Delta struct{ Content string } `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			t.Fatalf("chunk %q: %v", data, err)
+		}
+		if chunk.Object != "chat.completion.chunk" {
+			t.Fatalf("object %q", chunk.Object)
+		}
+		text.WriteString(chunk.Choices[0].Delta.Content)
+	}
+	if text.String() != "streamed" {
+		t.Fatalf("streamed %q", text.String())
+	}
+	if !strings.HasSuffix(strings.TrimSpace(string(b)), "data: [DONE]") {
+		t.Fatal("stream did not end with [DONE]")
+	}
+}
+
+func TestOpenAIRejectsUnknownModel(t *testing.T) {
+	f := newFakeOC(t)
+	_, srv := testHub(t, testRegistry(t, f.URL))
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown model got status %d", resp.StatusCode)
+	}
+	if sessions, _, _ := f.counts(); sessions != 0 {
+		t.Fatal("an unknown model reached an agent")
+	}
+}
+
 func TestHTTPHandleHasNoNostrIdentity(t *testing.T) {
 	f := newFakeOC(t)
 	reg := testRegistry(t, f.URL)
