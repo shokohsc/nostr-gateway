@@ -23,11 +23,17 @@ race, it is upstream — do not try to "fix" it in gateway code. `go test ./...`
 covers the Nostr path.
 
 The same version builds *identical* NIP-42 auth events when two subscriptions
-answer a challenge in the same second, and it keys the `OK` waiters by event id,
-so one of the two waits out the 7s `Relay.publish` timeout and resubscribes. Two
-subscriptions sharing one closed relay therefore start a few seconds apart, which
-is why the Buzz test gives `BUZZ_RELAYS` its own fake relay instead of pointing
-both relay lists at the same one.
+answer a challenge in the same second, and it keys the `OK` waiters by event id
+(`relay.go:371`), so the second `Store` overwrites the first and the loser of the
+pair waits out its context instead of returning. This is why each agent has its
+own pool **per role**: the `buzzPools` entry is a second, separate pool for
+`BUZZ_RELAYS`, so the kind-30078 listener and the Buzz discovery never answer a
+challenge on one connection. Sharing one is what made the gateway deaf — with a
+relay in both lists (the normal production setup, since the kind-30078 answers
+have to land somewhere the agent is a member) the discovery lost the race, sat
+out its whole 15s `buzzFetchTimeout`, returned empty with the member list right
+there, and the agent subscribed to no channel at all.
+`TestBuzzDiscoveryOnARelaySharedWithTheMessageListener` is the guard.
 
 ## Wiring
 
@@ -46,9 +52,11 @@ OpenCode session once, atomically) → `opencodeClient.promptAsync` → SSE from
 `buzz.go` is a transport like `nostr.go`, and it is subscribe-only with exactly one
 exception: the NIP-OA agent profile (kind `10100`), published once per agent to
 `BUZZ_RELAYS` so Buzz knows the pubkey is an agent. It must stay signed by the
-agent's own key, after a discovery that proved the connection passed NIP-42, and
-kind `10100` must not grow any channel traffic in its content. Buzz relays are
-never in `NOSTR_RELAYS` and nothing else is published to them, because a
+agent's own key, kind `10100` must not grow any channel traffic in its content,
+and `buzzProfile` must keep firing on a member list that names no channel — Buzz's
+channel UI is how an agent gets added to a channel, so an agent that waits to be a
+member to be registered is an agent that can never join.
+Apart from the profile, nothing is published to a Buzz relay, because a
 kind-30078 envelope stored on a Buzz relay surfaces in Buzz's own read-state view,
 and posting kind-9 answers back into a channel is not built yet. Inbound is
 unchanged — a mention becomes a prompt through `hub.Handle`, so `allow`, the lock
@@ -58,11 +66,15 @@ order and one-session-per-conversation all still hold.
 its NIP-42 handshake comes back empty: it answers the challenge once and returns
 (pool.go:662-673). Combined with the identical-auth-event note above, that turns
 "the relay sent nothing" into a 60-second wait in the old code. Discovery is
-therefore bounded (`buzzFetchTimeout`), re-asked once on an empty answer
-(`buzzRetryDelay`), and only an empty *second* answer is logged as "agent is in no
-channel yet". Keep that distinction — a discovery query is the one call in the
-gateway whose failure mode is silence, so anything that swallows its result makes
-the agent deaf with nothing in the log.
+therefore bounded (`buzzFetchTimeout`) and re-asked once on an empty answer
+(`buzzRetryDelay`). It reports three states, not two, and the distinction is load
+bearing: no member lists at all (a lost handshake, or a relay withholding the
+optional kind 39002) versus member lists that name no channel of ours (a wait for
+a join). Collapsing them sends the operator to fix the wrong thing — the log line
+used to claim "add it to a channel" when the relay had nothing to add it to.
+`buzzDiscover` returns the roster count for exactly that reason. A discovery
+query is the one call in the gateway whose failure mode is silence, so anything
+that swallows its result makes the agent deaf with nothing in the log.
 
 ## Security invariants — break these and it is a vulnerability, not a style nit
 

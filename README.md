@@ -89,7 +89,7 @@ the same.
 | `AGENTS_FILE` | — | Path to the agent registry (required) |
 | `AGENTS` | — | Same JSON inline, used when `AGENTS_FILE` is unset |
 | `NOSTR_RELAYS` | `wss://nos.lol,wss://relay.damus.io` | Comma-separated relay URLs |
-| `BUZZ_RELAYS` | unset | Comma-separated Buzz relay URLs. Set it and each agent also listens to the Buzz channels it is a member of; nothing is ever published there |
+| `BUZZ_RELAYS` | unset | Comma-separated Buzz relay URLs. Set it and each agent also listens to the Buzz channels it is a member of; nothing is ever published there apart from the agent profile. A relay may be named in both this and `NOSTR_RELAYS`: Buzz gets its own connection either way |
 | `GATEWAY_ADDR` | `:8080` | HTTP listen address |
 | `GATEWAY_TOKEN` | unset | Bearer token for the HTTP API; unset disables auth |
 | `OPENCODE_USER` / `OPENCODE_PASSWORD` | unset | Basic auth for OpenCode servers that require it |
@@ -106,7 +106,9 @@ subscription is closed with `auth-required: verification failed`.
 
 Each agent holds its own pool and therefore its own connection, because a
 closed relay accepts only events signed by the key that authenticated that
-connection.
+connection. A relay in `BUZZ_RELAYS` gets a second, separate pool per agent, so
+the Buzz handshake never collides with the kind-30078 one on a shared
+connection — see `AGENTS.md` for what that collision costs.
 
 ### Buzz channels
 
@@ -124,15 +126,19 @@ export BUZZ_RELAYS='ws://buzz.example.internal:3000'
   channel, so the agent's channels are discovered first, from the NIP-29 member
   lists (kind `39002`) the agent's own pubkey appears in. Membership is re-read
   every minute, so a channel the agent was added to later needs no restart.
-- A discovery that comes back with no member lists at all is re-asked a few
-  seconds later, because that is what a lost NIP-42 handshake looks like (see
-  `AGENTS.md`), not membership. Only a second empty answer is reported as
-  `buzz: agent is in no channel yet`, which means the relay has member lists and
-  none of them name the agent: add it to a channel, then reconcile the rosters.
+- A discovery has three outcomes, and they are logged apart because their fixes
+  are opposites. No member lists at all is re-asked a few seconds later, since
+  that is what a lost NIP-42 handshake looks like (see `AGENTS.md`) rather than
+  an answer. Still none after the retry means the relay is not serving kind
+  `39002` to this pubkey — NIP-29 calls it optional and lets a relay restrict
+  who may fetch it — and is reported as `buzz: relay serves no member lists for
+  this agent`. Member lists that name no channel is a real answer and is
+  reported as `buzz: agent is in no channel yet`: add the agent to a channel,
+  then reconcile the rosters.
 - A message is a prompt when it carries a `p` tag for the agent, or when it
   arrives in a two-member channel. Everything else in a group channel is
   ignored, and the `allow` list still applies.
-- The channel uuid is the conversation id (`buzz-<uuid>`), so one channel is one
+- The channel uuid is the conversation id (`buzz-<channel-uuid>`), so one channel is one
   OpenCode session. The same rules work over the HTTP API:
   `POST /v1/messages` with `"conversation": "buzz-<channel-uuid>"` and
   `GET /v1/conversations/buzz-<channel-uuid>/events`.
@@ -143,7 +149,11 @@ export BUZZ_RELAYS='ws://buzz.example.internal:3000'
 (kind `10100`), which is what Buzz reads to know which pubkeys are agents, and
 which has to be signed by the agent's own key — something no operator can do by
 hand, because the `nsec` belongs to the gateway. It is replaceable, so it is
-published once, after the relay has proved the connection passes NIP-42.
+published once, as soon as the relay has served a member list — that is what
+proves the connection passed NIP-42. It does not wait for the agent to be in a
+channel: Buzz's channel UI is how an agent gets added to one, so an agent
+waiting to be a member to be registered is an agent that can never join.
+
 
 **Inbound otherwise.** Answers keep going out as encrypted kind-`30078` envelopes
 to the sender's key on `NOSTR_RELAYS`; no channel traffic is ever published to a
@@ -221,6 +231,10 @@ republishes under its own protocol.
   removed from keeps its conversation until the next rediscovery. A discovery
   query itself is capped at 15 seconds, so an unresponsive Buzz relay delays the
   agent rather than deafening it permanently.
+- A Buzz relay that serves no kind `39002` to the agent leaves the agent deaf
+  with a working connection — NIP-29 makes the member list optional. The gateway
+  says which of the two cases it is in the log; it cannot work around a relay
+  that withholds the roster.
 - `go test -race` skips `nostr_test.go`: go-nostr v0.52.3 has a data race in its
   own connect path (`Relay.ConnectWithTLS` writing `r.Connection` while
   `Relay.close` reads it, `relay.go:175` vs `relay.go:576`) that fires as soon as
@@ -245,6 +259,8 @@ and body-size rejection, an oversized event surviving the stream, the allow list
 on the Nostr path, HTTP being unable to redirect Nostr replies, registry
 loading and key normalisation from env, a Buzz mention and a Buzz DM reaching
 OpenCode (and group chatter not reaching it) with one session per channel, a Buzz
-discovery recovering from a refused NIP-42 handshake, and a full Nostr round trip
+discovery recovering from a refused NIP-42 handshake, a Buzz discovery on a relay
+that is also a `NOSTR_RELAYS` entry, the agent profile published before the agent
+is in any channel, and a full Nostr round trip
 (NIP-44, kind, `p` tag routing, encrypted reply) against an in-process fake relay,
 including a relay that demands NIP-42 and authenticates each agent separately.
