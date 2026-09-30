@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -18,20 +19,22 @@ import (
 // messages when it names that channel in #h — the agent's channels have to be
 // discovered before it can hear anything.
 //
-// This is inbound, except for one thing: the NIP-OA agent profile (buzzProfileKind)
-// that tells Buzz which pubkeys are agents. The gateway holds the agent's nsec, so
-// it is the only party that can sign that profile at all. Answers still go out the
-// way they always have: NIP-44 encrypted kind-30078 envelopes to the sender's key
-// on NOSTR_RELAYS. Posting back into a Buzz channel is a separate feature (kind 9,
-// the same h tag, no encryption) and is deliberately not here, so no channel
-// traffic is ever published to a Buzz relay.
+// Outbound is a kind-9 message in the same channel, signed by the agent's own
+// key, plus the NIP-OA agent profile (buzzProfileKind) that tells Buzz which
+// pubkeys are agents. The gateway holds the agent's nsec, so it is the only party
+// that can sign either. A kind-30078 envelope is not what a Buzz client renders
+// in a channel, so an answer to a mention has to be posted as channel traffic —
+// one message per turn, not one per streaming delta.
 const (
 	buzzChatKind   = 9     // NIP-29 message: #h = channel uuid, p = mention
 	buzzMemberKind = 39002 // NIP-29 member list: d = channel uuid, p = every member
 	// buzzProfileKind is the NIP-OA agent profile Buzz reads to tell an agent
-	// apart from a person, and the only thing the gateway publishes to a Buzz
-	// relay. Replaceable (10000-19999), so one event per author is enough.
+	// apart from a person. Replaceable (10000-19999), so one event per author
+	// is enough.
 	buzzProfileKind = 10100
+	// buzzConvPrefix marks a conversation that is a Buzz channel, so the answer
+	// goes back into the channel instead of out as a kind-30078 envelope.
+	buzzConvPrefix = "buzz-"
 	// buzzDMMembers is what makes a channel a DM: the agent and one other person.
 	buzzDMMembers = 2
 	// buzzRefresh re-reads the member lists, so a channel the agent joined after
@@ -60,8 +63,17 @@ type buzzChannels map[string]int
 
 // buzzConversation is the conversation id of a Buzz channel, so one channel maps
 // to one OpenCode session — the session scope buzz-acp defaults to as well. The
-// prefix keeps channel uuids clear of the ids the gateway mints itself.
-func buzzConversation(channel string) string { return "buzz-" + channel }
+// prefix keeps channel uuids clear of the ids the gateway mints itself, and it is
+// also how the outbound half recognises the conversation: the hub is
+// transport-blind, so the id is the only thing that says where an answer goes.
+func buzzConversation(channel string) string { return buzzConvPrefix + channel }
+
+// buzzChannelOf is the inverse: the channel a conversation belongs to, or false
+// for a conversation that is not a Buzz channel at all.
+func buzzChannelOf(conv string) (string, bool) {
+	channel, ok := strings.CutPrefix(conv, buzzConvPrefix)
+	return channel, ok && channel != ""
+}
 
 // buzzDiscover lists the channels the agent is in. NIP-29 publishes one member
 // list per channel, and the agent's own pubkey on it means the agent is a
@@ -262,6 +274,14 @@ func (n *nostrTransport) buzzProfile(ctx context.Context, a *Agent) {
 // allow list is checked before anything else, and the mention is the p tag, not
 // the @name in the text.
 func (n *nostrTransport) buzzReceive(ctx context.Context, a *Agent, ev *nostr.Event, chans buzzChannels) {
+	// Our own channel replies come back on our own subscription: a relay fans an
+	// event out to the connection that published it too, and go-nostr does not
+	// filter self-authored events. In a two-member channel every message counts
+	// as addressed to the agent, so without this the agent would answer itself,
+	// one answer per answer.
+	if ev.PubKey == a.PubKey {
+		return
+	}
 	if !a.allows(ev.PubKey) {
 		return
 	}
@@ -288,10 +308,84 @@ func (n *nostrTransport) buzzReceive(ctx context.Context, a *Agent, ev *nostr.Ev
 		in.Sender = npub
 	}
 	if _, err := n.hub.Handle(ctx, a, in, ev.PubKey); err != nil {
-		// Nowhere to answer: an error envelope would have to be posted into the
-		// channel, and this transport is subscribe-only.
+		// Nowhere to answer on a transport of its own: a rejected message still
+		// has to come back, or the sender cannot tell it apart from a lost relay
+		// event. It lands in the channel as a kind-9 like any other answer.
 		n.log.Warn("buzz inbound", "agent", a.Name, "channel", channel, "err", err)
+		n.reply(a, ev.PubKey, Envelope{
+			V: protocolVersion, Conversation: buzzConversation(channel), Agent: a.Name,
+			Type: TypeError, Timestamp: time.Now().UTC(),
+			Payload: Payload{Error: err.Error(), Text: err.Error()},
+		})
 	}
+}
+
+// buzzJob folds one protocol event into what the channel will get. A channel
+// message is one posted message, so the answer is assembled from the streaming
+// deltas and posted once the turn ends — posting each delta would put one
+// message per token in front of the reader. Everything a human does not want to
+// read in a chat (acks, tool calls, reasoning, progress) contributes nothing, and
+// a turn that produced no text posts nothing at all.
+//
+// It runs on the publish worker goroutine, which is its only writer, so the
+// in-flight text needs no lock.
+func (n *nostrTransport) buzzJob(ctx context.Context, j job) error {
+	post := func(text string) error {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return nil
+		}
+		delete(n.turns, j.env.Conversation)
+		return n.buzzPost(ctx, j.agent, j.buzz, j.peer, text)
+	}
+	switch j.env.Type {
+	case TypeMessage:
+		t, ok := n.turns[j.env.Conversation]
+		if !ok {
+			t = &strings.Builder{}
+			n.turns[j.env.Conversation] = t
+		}
+		t.WriteString(j.env.Payload.Text)
+		return nil
+	case TypeCompleted:
+		return post(n.turns[j.env.Conversation].String())
+	case TypeError:
+		// Whatever the turn said so far, the error is what matters now.
+		n.turns[j.env.Conversation] = nil
+		return post(j.env.Payload.Text)
+	case TypePermissionReq:
+		// Asked in its own message, because it is its own decision. Answering it
+		// from Buzz is not wired: a reply in the channel is a prompt, not a
+		// permission_response, so approving still needs the HTTP API.
+		return post(j.env.Payload.Text)
+	}
+	return nil
+}
+
+// buzzPost publishes one NIP-29 message into a channel, signed by the agent's own
+// key — the agent is a member of the channel, which is how it discovered it, and
+// a closed relay accepts nothing else. The p tag names the person who asked, so
+// a group client renders the answer as addressed to them.
+func (n *nostrTransport) buzzPost(ctx context.Context, a *Agent, channel, peer, text string) error {
+	pool, ok := n.buzzPools[a.Name]
+	if !ok {
+		return fmt.Errorf("agent %s has no buzz pool", a.Name)
+	}
+	tags := nostr.Tags{{"h", channel}}
+	if peer != "" {
+		tags = append(tags, nostr.Tag{"p", peer})
+	}
+	ev := nostr.Event{Kind: buzzChatKind, CreatedAt: nostr.Now(), Tags: tags, Content: text}
+	if err := ev.Sign(a.sk); err != nil {
+		return err
+	}
+	var firstErr error
+	for res := range pool.PublishMany(ctx, n.buzzRelays, ev) {
+		if res.Error != nil && firstErr == nil {
+			firstErr = res.Error
+		}
+	}
+	return firstErr
 }
 
 // wait sleeps for d and reports whether the wait finished rather than the
