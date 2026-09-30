@@ -42,7 +42,8 @@ transports) and `hub.emit` (outbound, all transports). `opencode.go` is the only
 file allowed to speak the OpenCode HTTP API; `reduce.go` is the only place that
 translates OpenCode events into protocol events. Keep it that way — the point of
 the gateway is that no transport or agent can see OpenCode's wire format or its
-`:4096` address.
+`:4096` address. The `/v1/chat/completions` face in `http.go` is a translation of
+the same two functions, not a path around them.
 
 Data flow: transport → `hub.Handle` → `conversation.ensureSession` (creates the
 OpenCode session once, atomically) → `opencodeClient.promptAsync` → SSE from
@@ -142,7 +143,12 @@ backpressure.
 
 - Reject with `invalid(...)` from `hub.go` for anything the caller got wrong;
   `http.go` maps that to 400 and everything else to 502. Returning a bare error
-  silently changes the status code.
+  silently changes the status code. A transport that wants a different status
+  code checks `errors.Is(err, errInvalid)` itself.
+- `untilTurnEnd` is how a synchronous request turns an asynchronous turn into a
+  response, and the ack id is the cursor: `subscribe` replays the conversation's
+  history, so without cutting at the ack a continued conversation would answer
+  with the previous turn. Do not replace that with a timestamp comparison.
 - In-memory only. No database, no eviction, no persistence — a restart drops
   conversation→session state. Keep it that way unless asked.
 - Config is static JSON (`AGENTS_FILE` or inline `AGENTS`), not a CRD watcher.

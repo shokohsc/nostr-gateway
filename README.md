@@ -26,8 +26,52 @@ Implements plan.md.
   `POST /session/:id/permission/:id/reply` when the first is a 404.
 - **Plain HTTP API** for curl, tests and non-Nostr callers: `POST /v1/messages`
   and `GET /v1/conversations/{id}/events` (SSE).
+- **OpenAI-compatible API** for anything that already speaks it — a chat client,
+  a bot framework, an agent tool: `GET /v1/models` and
+  `POST /v1/chat/completions` (streaming and not). See below.
+
+## Chat clients: the OpenAI-compatible API
+
+`/v1/chat/completions` is the same agent, the same conversation and the same
+session as everything else here — only the wire format is the one every chat
+client and every agent framework already speaks, so nothing has to be written to
+drive it. Set `model` to the agent (`GET /v1/models` lists them, prefixed with
+`opencode-nostr-gateway/`) and `user` to whoever is talking, which is what scopes
+the conversation, since OpenAI has no id for one. A request with no `user` gets
+its own conversation, which is what a stateless client should get.
+
+```bash
+curl -sS localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_TOKEN" \
+  -d '{"model":"opencode-nostr-gateway/frontend-agent","user":"alice",
+       "messages":[{"role":"user","content":"why is the build red?"}]}'
+# {"object":"chat.completion","model":"opencode-nostr-gateway/frontend-agent",
+#  "choices":[{"message":{"role":"assistant","content":"…"}}],
+#  "conversation":"oai-alice", ...}
+
+curl -N -sS localhost:8080/v1/chat/completions -d '{"model":"…","stream":true,"messages":[…]}'
+# data: {"object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"}}], …}
+# data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"the "}}], …}
+# data: [DONE]
+```
+
+`"stream": true` returns `text/event-stream` with `chat.completion.chunk`
+objects and a `data: [DONE]` terminator. `user` is echoed back as
+`conversation`, so a client that wants the full protocol — every event, tool
+calls included — can follow the same conversation on
+`GET /v1/conversations/{id}/events`.
+
+The mapping is deliberately lossy in one direction: OpenAI has no way to express
+a tool call, a progress event or a permission request, so the response carries
+the answer text and nothing else. Anything more than the answer comes back over
+the protocol stream above. That is also why this surface is not how a permission
+request is answered — a client here cannot approve one, and the request arrives
+as an error rather than a hang.
 
 ## Protocol
+
+The gateway's own envelope protocol. Use it when you want every event; use
+`/v1/chat/completions` above when you want a chat client.
 
 ```json
 {
@@ -219,7 +263,7 @@ and `hub.emit` (outbound):
 | `sessions.go` | conversation ↔ OpenCode session mapping |
 | `nostr.go` | Nostr transport: subscribe, decrypt, publish |
 | `buzz.go` | Buzz channels: discover, subscribe, turn a mention into a prompt |
-| `http.go` | `POST /v1/messages`, SSE stream, bearer auth |
+| `http.go` | `POST /v1/messages`, SSE stream, bearer auth, `/v1/chat/completions` |
 | `registry.go` | Agent config, keys, per-peer NIP-44 key cache |
 
 OpenCode's `:4096` is never exposed. The gateway calls it cluster-internal and
@@ -248,7 +292,13 @@ republishes under its own protocol.
   the pool subscribes, and it is the latest published version. The rest of the
   suite is race-clean; the Nostr tests run in the normal suite.
 - Tool output is sent whole (capped at 32 MB per event) and not truncated.
-- `model` and `opencode_agent` are global per agent, not per conversation.
+- `model` and `opencode_agent` are global per agent, not per conversation, and
+  not per request: an OpenAI `model` picks the agent, never the model behind it.
+- The OpenAI surface cannot express a tool call, a progress event or a permission
+  request, so it carries the answer text only. `usage` is always zero — nothing
+  counts tokens here.
+- Two clients with the same `user` share one conversation, and therefore one
+  OpenCode session and one reply channel.
 - A conversation has one reply channel: replies go to whoever spoke last. Two
   allow-listed users sharing a conversation is not a group chat.
 
@@ -261,7 +311,10 @@ go test ./...
 Covers the prompt flow end to end over HTTP, the permission approval loop on
 both OpenCode API generations, session reuse (including four simultaneous first
 messages creating exactly one session), cross-agent conversation rejection, the
-reducer's delta/dedupe rules, replay for late SSE subscribers, protocol version
+reducer's delta/dedupe rules, replay for late SSE subscribers, the OpenAI surface
+(`/v1/models`, a non-streaming completion, a streamed one ending in `[DONE]`, an
+unknown model rejected, and a continued conversation not carrying the previous
+turn's answer), protocol version
 and body-size rejection, an oversized event surviving the stream, the allow list
 on the Nostr path, HTTP being unable to redirect Nostr replies, registry
 loading and key normalisation from env, a Buzz mention and a Buzz DM reaching
