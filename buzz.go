@@ -69,6 +69,21 @@ type buzzChannels map[string]int
 // transport-blind, so the id is the only thing that says where an answer goes.
 func buzzConversation(channel string) string { return buzzConvPrefix + channel }
 
+// buzzChannelTag reads the channel id off an event, accepting either name. The
+// member lists name it in `d` (buzzDiscover reads it from there and that is how
+// the channel list is built) and chat messages are written in `h` (buzzPost), so
+// the gateway itself uses both, and nothing in the protocol says which one a
+// Buzz chat message carries. Resolving both is what lets a message through on a
+// relay that picked the other one — the previous behaviour filtered the
+// subscription by `h` as well, so a `d`-only message never arrived to be
+// misread. Returns "" when neither is present, which buzzReceive logs.
+func buzzChannelTag(tags nostr.Tags) string {
+	if c := tagValue(tags, "h"); c != "" {
+		return c
+	}
+	return tagValue(tags, "d")
+}
+
 // buzzChannelOf is the inverse: the channel a conversation belongs to, or false
 // for a conversation that is not a Buzz channel at all.
 func buzzChannelOf(conv string) (string, bool) {
@@ -177,12 +192,20 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 
 		filter := nostr.Filter{
 			Kinds: []int{buzzChatKind},
-			Tags:  nostr.TagMap{"h": ids},
-			// No authors filter, deliberately: see nostr.listen. A relay-side
-			// allow list would drop a blocked sender before buzzReceive could
-			// name it, and the Warn that names it is the only thing that tells an
-			// operator their allow list is wrong instead of their relay is.
-			// ponytail: a busy channel pays for events the agent then refuses.
+			// Kinds and nothing else, deliberately: see nostr.listen. This used
+			// to carry `#h: <the discovered channels>`, which is a guess at
+			// Buzz's tag convention that buzzDiscover itself contradicts — it
+			// reads the channel id off the `d` tag of the kind-39002 member
+			// list. A relay applies `#h` before delivery, so if Buzz names the
+			// channel anything else on a chat message the agent is deaf in every
+			// channel with nothing logged, and nothing in the protocol pins the
+			// choice. buzzReceive resolves both names instead, and a channel it
+			// cannot resolve is logged, so the convention becomes visible instead
+			// of fatal.
+			// ponytail: fan-out for every kind-9 on the relay for a minute at a
+			// time, which the gateway then drops as not-a-member. A relay serving
+			// many channels makes that costly; a periodic self-REQ to prove
+			// delivery buys the narrowing back.
 			// The same 5s slack as the kind-30078 subscription: a longer Since
 			// would replay channel history into brand-new OpenCode sessions.
 			Since: ptr(nostr.Now() - 5),
@@ -307,7 +330,7 @@ func (n *nostrTransport) buzzReceive(ctx context.Context, a *Agent, ev *nostr.Ev
 			"hint", "add this pubkey to the agent's allow list in AGENTS_FILE and restart, or the sender is deaf")
 		return
 	}
-	channel := tagValue(ev.Tags, "h")
+	channel := buzzChannelTag(ev.Tags)
 	members, member := chans[channel]
 	if !member {
 		n.log.Warn("buzz: inbound message in a channel the agent is not in",

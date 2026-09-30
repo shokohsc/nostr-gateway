@@ -174,6 +174,12 @@ export BUZZ_RELAYS='ws://buzz.example.internal:3000'
   channel, so the agent's channels are discovered first, from the NIP-29 member
   lists (kind `39002`) the agent's own pubkey appears in. Membership is re-read
   every minute, so a channel the agent was added to later needs no restart.
+- That `#h` narrowing is **not** put in the subscription. A relay applies it
+  before delivering, so an event tagged with anything other than `h` — a `d` tag,
+  which is the name the NIP-29 member lists themselves use for the same value —
+  would be dropped by the relay and the mention would vanish with nothing logged.
+  The gateway reads the channel from `h` or `d`, checks membership itself, and
+  logs the refusal, so the fan-out of every kind-9 on the relay is paid instead.
 - A discovery has three outcomes, and they are logged apart because their fixes
   are opposites. No member lists at all is re-asked a few seconds later, since
   that is what a lost NIP-42 handshake looks like (see `AGENTS.md`) rather than
@@ -259,10 +265,12 @@ The list is enforced by the gateway, **not** handed to the relay as a
 subscription filter. A relay drops a non-matching event before delivering it, so
 a relay-side `authors` filter would make a blocked sender — or a typo'd pubkey —
 look identical to a broken relay: the agent goes deaf and nothing is logged. The
-gateway applies `allow` itself, which is both the real security boundary and the
-place where the refusal can be logged with the pubkey that caused it. The cost is
-fan-out: the relay streams every event in the subscribed kinds to the gateway
-and the gateway throws the blocked ones away.
+same is true of every other tag filter, which is why the only one the gateway
+sends is the `p` that *addresses* an envelope to an agent. The gateway applies
+`allow` itself, which is both the real security boundary and the place where the
+refusal can be logged with the pubkey that caused it. The cost is fan-out: the
+relay streams every event in the subscribed kinds to the gateway and the gateway
+throws the blocked ones away.
 
 ```bash
 go build -o nostr-gateway .
@@ -315,10 +323,11 @@ republishes under its own protocol.
   one request per id. There is no rate limit and no cap either.
 - The Nostr subscription only looks 5 seconds back, so a gateway restart misses
   messages sent while it was down. Same for a Buzz channel subscription.
-- `allow` is not a relay-side filter, so the relay streams every event in the
-  subscribed kinds to the gateway and the gateway discards the blocked ones. A
-  busy channel with a short allow list pays that fan-out. See the `allow`
-  section above for why it is not pushed down to the relay.
+- `allow` is not a relay-side filter, and neither is a channel or kind
+  narrowing, so the relay streams every event in the subscribed kinds to the
+  gateway and the gateway discards the ones it does not want. A busy channel with
+  a short allow list pays that fan-out. See the `allow` section above for why it is
+  not pushed down to the relay.
 - Buzz carries the answer back as a kind `9` in the channel, but only the answer:
   tool calls, reasoning and progress are not posted. A permission request raised
   by a mention is posted and cannot be answered from the channel.
@@ -326,6 +335,11 @@ republishes under its own protocol.
   seen. Neither is a message that arrives between one membership rediscovery and
   the next: a channel the agent has just joined only starts delivering on the
   subscription that named it.
+- A kind-9 envelope has to carry the channel in an `h` or `d` tag, and the
+  gateway only accepts it if the channel is one the agent is currently a member
+  of. A message that names the channel any other way, or a channel the agent has
+  not been added to yet, is refused — with the reason in the log, which is the
+  one thing a relay-side filter could never have told you.
 - A channel the agent is added to is picked up within a minute; a channel it is
   removed from keeps its conversation until the next rediscovery. A discovery
   query itself is capped at 15 seconds, so an unresponsive Buzz relay delays the
@@ -367,8 +381,10 @@ reducer's delta/dedupe rules, replay for late SSE subscribers, the OpenAI surfac
 unknown model rejected, and a continued conversation not carrying the previous
 turn's answer), protocol version
 and body-size rejection, an oversized event surviving the stream, the allow list
-on the Nostr path (and *not* leaking it to the relay as a subscription filter),
-HTTP being unable to redirect Nostr replies, registry
+on the Nostr path and the absence of *any* relay-side filter that could swallow
+an event before the gateway could log it (the `p` address tag excepted, and a
+kind-9 message tagged with `d` reaching OpenCode), HTTP being unable to redirect
+Nostr replies, registry
 loading and key normalisation from env, a Buzz mention and a Buzz DM reaching
 OpenCode (and group chatter not reaching it) with one session per channel, a
 streamed answer assembled into one kind-9 channel message with nothing published

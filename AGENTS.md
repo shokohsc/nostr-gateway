@@ -123,10 +123,21 @@ that swallows its result makes the agent deaf with nothing in the log.
   unreachable, and the agent was deaf on both transports with a clean log. The
   gateway-side check is the real boundary, so keep the filter wide and take the
   fan-out; a relay-side filter is only safe paired with a periodic self-REQ to
-  prove delivery. `TestAllowListIsNotARelaySideFilter` is the guard. Note that
-  the fake relay ignores filters entirely — the REQ handler replays every stored
-  event to every subscriber — so it can only catch a filter that was never sent,
-  never one the relay would honour.
+  prove delivery. Note that the fake relay ignores filters entirely — the REQ
+  handler replays every stored event to every subscriber — so it can only catch a
+  filter that was never sent, never one the relay would honour.
+- **That is the whole rule, not just `authors`: the only tag filter the gateway
+  may send is the `p` that addresses an envelope.** `buzzListen` also used to send
+  `Tags: {"h": ids}` and that is the same bug wearing a different hat — the relay
+  drops a kind-9 that carries `d` instead of `h` (the name NIP-29's own member
+  lists use for the same value) before the gateway's membership check can log
+  anything. So `buzzChannelTag` accepts `h` or `d` and `buzzReceive` does the
+  membership check. Do not "optimise" either filter back. The exception is real
+  and is not an optimisation: `#p` is addressing, not narrowing, and two layers
+  enforce it (the REQ and go-nostr's client-side `Filter.Matches`, which does run —
+  verified, do not re-derive this by grepping for `Matches` outside `filter.go`).
+  `TestGatewayNeverAsksTheRelayToFilter` and `TestNostrRoutesByPTag` are the two
+  guards, and between them they cover both halves.
 - **Keys are normalised to hex exactly once**, in `loadRegistry`. A bech32 pubkey
   reaching go-nostr produces a `p` tag filter that never matches a real relay —
   the agent goes silently deaf, with no error anywhere. `TestNostrRoutesByPTag`

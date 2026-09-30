@@ -598,6 +598,15 @@ func TestHTTPCannotRedirectNostrReplies(t *testing.T) {
 // where it is enforced: the client's p tag must equal the agent's hex pubkey.
 // This is the test that fails if the registry ever hands go-nostr a bech32
 // pubkey instead of hex — the agent would silently never hear anything.
+// A kind-30078 envelope is a message to one agent, and the p tag is the only
+// thing that says which one. The conversation key is derived from the sender and
+// this agent, never from the tag, so an envelope addressed elsewhere decrypts
+// perfectly and would become a prompt here if it ever arrived — which is why
+// the `#p` filter in nostr.listen is load-bearing addressing, not a narrowing to
+// be trimmed for fan-out. Two layers enforce it, the REQ and go-nostr's own
+// client-side match, and this test fails if either goes: the fake relay replays
+// every stored event to every subscriber, so nothing in the harness hides a
+// missing filter.
 func TestNostrRoutesByPTag(t *testing.T) {
 	f := newFakeOC(t)
 	relay := newFakeRelay(t)
@@ -673,16 +682,26 @@ func TestNostrAuthenticatesPerAgentOnAClosedRelay(t *testing.T) {
 	waitFor(t, "message through a closed relay", func() bool { _, p, _ := f.counts(); return p == 1 })
 }
 
-// The allow list must not go into the relay-side filter, on either transport.
-// A relay enforces `authors` before it delivers, so a sender the agent does not
-// allow is dropped by the relay and never reaches the gateway's own allows()
-// check — which means the refusal is never logged, and the agent is deaf for
-// both Buzz and kind-30078 with nothing at all in the log. That is exactly the
-// failure a Warn was added to prevent, so the outer filter has to go: the
-// client-side check is the security boundary (it runs before decryption) and it
-// is the only one that can say why. The cost is fan-out for events the agent
-// then refuses, which a channel-sized relay makes cheap.
-func TestAllowListIsNotARelaySideFilter(t *testing.T) {
+// The gateway must ask the relay for kinds and nothing else. A relay applies
+// `authors` and every `#tag` before it delivers, so anything the gateway puts
+// in the outer filter is a way to be deaf with a clean log: there is no code
+// left to run, so nothing logs, and the only evidence is the relay's own view
+// of a REQ. Both transports shipped two of these. `authors` dropped a blocked
+// sender before allows() could name it. `#p` on the kind-30078 filter was pure
+// downside — receive() routes on the conversation key derived from the sender's
+// pubkey and never reads the p tag, so the filter could only lose events, and a
+// client that does not tag `p` for this agent is indistinguishable from a dead
+// relay. `#h` on the kind-9 filter is a guess at Buzz's tag convention that
+// buzzDiscover itself contradicts: it reads the channel id from the `d` tag of
+// the member list. Either name can be wrong, and the gateway cannot tell.
+//
+// So the filters carry kinds and a Since, and every "is this for me" decision
+// moves back to the gateway, where it can be logged. The cost is fan-out for
+// events the agent then refuses, which a channel-sized relay makes cheap.
+// ponytail: a relay that filters a large public channel set would make this
+// expensive; a periodic self-REQ to prove delivery is the upgrade that buys the
+// narrowing back.
+func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 	f := newFakeOC(t)
 	relay := newFakeRelay(t)
 	relay.store = true
@@ -729,11 +748,91 @@ func TestAllowListIsNotARelaySideFilter(t *testing.T) {
 	relay.mu.Lock()
 	defer relay.mu.Unlock()
 	for i, f := range relay.filters {
+		listener := false
+		for _, k := range f.Kinds {
+			if k == messageKind || k == buzzChatKind {
+				listener = true
+			}
+		}
+		if !listener {
+			// The kind-39002 member-list query is a different animal: a one-shot
+			// FetchMany whose `p` filter is how a member list names its members,
+			// and whose failure buzzDiscover already reports in three states. A
+			// wrong filter there costs a channel, and it says so.
+			continue
+		}
 		if len(f.Authors) != 0 {
 			t.Errorf("REQ %d asks the relay for authors %v: a blocked sender is dropped "+
 				"by the relay and the gateway never logs the refusal", i, f.Authors)
 		}
+		// A kind-30078 p tag is the addressing and stays: the relay and
+		// go-nostr both route on it, and receive() would decrypt a message meant
+		// for a different agent because the conversation key comes from the
+		// sender and this agent, not from the tag.
+		for tag, vals := range f.Tags {
+			if tag == "p" && hasKind(f, messageKind) {
+				continue
+			}
+			t.Errorf("REQ %d asks the relay for %s in %v: the relay drops a non-match "+
+				"before delivery, so a wrong tag name is silence, not a message", i, tag, vals)
+		}
 	}
+}
+
+func hasKind(f nostr.Filter, kind int) bool {
+	for _, k := range f.Kinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// Buzz's own kind-9 events have to reach the agent whichever tag carries the
+// channel. buzzDiscover reads the channel id off the `d` tag of a kind-39002
+// member list, so a gateway that filtered and looked up `h` only would be
+// deaf on a relay that uses `d` for chat messages too — and the fake relay
+// ignores filters, so this is the only place that difference is visible.
+func TestBuzzChannelMessageTaggedDReachesOpenCode(t *testing.T) {
+	f := newFakeOC(t)
+	relay := newFakeRelay(t)
+	reg := &Registry{byName: map[string]*Agent{
+		"frontend-agent": {
+			Name: "frontend-agent", OpenCode: f.URL, PubKey: strings.Repeat("cd", 32),
+			sk: nostr.GeneratePrivateKey(), ck: map[string][32]byte{},
+		},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, []string{relay.url()}, reg, h, log)
+	h.nostr = nt
+	go h.run(ctx)
+	go nt.run(ctx)
+
+	agent := reg.byName["frontend-agent"]
+	relay.store = true
+	relay.inject(buzzMembers(t, nostr.GeneratePrivateKey(), agent.PubKey, "chan-1", 2))
+	waitFor(t, "the channel listener is up", func() bool {
+		relay.mu.Lock()
+		defer relay.mu.Unlock()
+		for _, f := range relay.filters {
+			for _, k := range f.Kinds {
+				if k == 9 {
+					return true
+				}
+			}
+		}
+		return false
+	})
+
+	// The channel, named by d only — no h tag anywhere on this event.
+	relay.inject(buzzMessage(t, nostr.GeneratePrivateKey(), "d", "chan-1", "", "hi from d"))
+	waitFor(t, "a d-tagged channel message to become a prompt", func() bool {
+		_, prompts, _ := f.counts()
+		return prompts == 1
+	})
 }
 
 // A Buzz mention is a kind-9 message carrying a p tag for the agent, and a Buzz
@@ -762,10 +861,10 @@ func TestBuzzMentionsAndDMsReachOpenCode(t *testing.T) {
 	group, dm := "channel-group", "channel-dm"
 	buzz.inject(buzzMembers(t, usk, apk, group, 3))
 	buzz.inject(buzzMembers(t, usk, apk, dm, 2))
-	buzz.inject(buzzMessage(t, usk, group, "", "morning everyone"))
-	buzz.inject(buzzMessage(t, usk, group, apk, "@frontend-agent why is the build red?"))
-	buzz.inject(buzzMessage(t, usk, group, apk, "and now?"))
-	buzz.inject(buzzMessage(t, usk, dm, "", "just the two of us"))
+	buzz.inject(buzzMessage(t, usk, "h", group, "", "morning everyone"))
+	buzz.inject(buzzMessage(t, usk, "h", group, apk, "@frontend-agent why is the build red?"))
+	buzz.inject(buzzMessage(t, usk, "h", group, apk, "and now?"))
+	buzz.inject(buzzMessage(t, usk, "h", dm, "", "just the two of us"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -835,7 +934,7 @@ func TestBuzzAnswerIsPostedBackIntoTheChannel(t *testing.T) {
 	// A DM: the human and the agent, which is the shape the report was about.
 	dm := "channel-dm-out"
 	buzz.inject(buzzMembers(t, usk, apk, dm, 2))
-	buzz.inject(buzzMessage(t, usk, dm, "", "@frontend-agent hello"))
+	buzz.inject(buzzMessage(t, usk, "h", dm, "", "@frontend-agent hello"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -904,13 +1003,13 @@ func TestBuzzIgnoresItsOwnChannelReplies(t *testing.T) {
 	nt := newNostrTransport(context.Background(), nil, nil, reg, h, log)
 
 	// The agent's own kind-9, in a two-member channel, addressed to the agent.
-	own := buzzMessage(t, ask, "channel-dm", apk, "the agent's own answer")
+	own := buzzMessage(t, ask, "h", "channel-dm", apk, "the agent's own answer")
 	nt.buzzReceive(context.Background(), agent, own, buzzChannels{"channel-dm": 2})
 	if _, p, _ := f.counts(); p != 0 {
 		t.Fatal("the agent prompted itself on its own channel reply")
 	}
 	// The same message from the human is still a prompt.
-	nt.buzzReceive(context.Background(), agent, buzzMessage(t, usk, "channel-dm", "", "hello"),
+	nt.buzzReceive(context.Background(), agent, buzzMessage(t, usk, "h", "channel-dm", "", "hello"),
 		buzzChannels{"channel-dm": 2})
 	waitFor(t, "the human's message to reach OpenCode", func() bool { _, p, _ := f.counts(); return p == 1 })
 }
@@ -938,12 +1037,12 @@ func TestBuzzRefusalsNameTheFault(t *testing.T) {
 	chans := buzzChannels{"channel-dm": 2, "channel-group": 5}
 
 	nt.buzzReceive(context.Background(), agent,
-		buzzMessage(t, stranger, "channel-dm", "", "hi"), chans)
+		buzzMessage(t, stranger, "h", "channel-dm", "", "hi"), chans)
 	nt.buzzReceive(context.Background(), agent,
-		buzzMessage(t, usk, "channel-elsewhere", "", "hi"), chans)
+		buzzMessage(t, usk, "h", "channel-elsewhere", "", "hi"), chans)
 	// A group message with no mention is not a fault, and must stay quiet.
 	nt.buzzReceive(context.Background(), agent,
-		buzzMessage(t, usk, "channel-group", "", "hi"), chans)
+		buzzMessage(t, usk, "h", "channel-group", "", "hi"), chans)
 
 	for _, want := range []string{
 		"level=WARN msg=\"buzz: inbound message from a pubkey the agent does not allow\"",
@@ -984,7 +1083,7 @@ func TestBuzzDiscoverySurvivesALostNIP42Handshake(t *testing.T) {
 
 	group := "channel-after-retry"
 	buzz.inject(buzzMembers(t, usk, apk, group, 3))
-	buzz.inject(buzzMessage(t, usk, group, apk, "@frontend-agent did you get that?"))
+	buzz.inject(buzzMessage(t, usk, "h", group, apk, "@frontend-agent did you get that?"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1030,7 +1129,7 @@ func TestBuzzDiscoveryOnARelaySharedWithTheMessageListener(t *testing.T) {
 
 	group := "channel-shared-relay"
 	relay.inject(buzzMembers(t, usk, apk, group, 3))
-	relay.inject(buzzMessage(t, usk, group, apk, "@frontend-agent are you there?"))
+	relay.inject(buzzMessage(t, usk, "h", group, apk, "@frontend-agent are you there?"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1117,9 +1216,12 @@ func buzzMembers(t *testing.T, sk, agent, channel string, members int) *nostr.Ev
 
 // buzzMessage is a NIP-29 chat message: h is the channel, and p is set only when
 // the agent was mentioned.
-func buzzMessage(t *testing.T, sk, channel, mention, text string) *nostr.Event {
+// tag names the channel explicitly: the gateway reads the channel off both "h"
+// and "d" because buzzDiscover uses "d" on the member list and nothing in the
+// protocol pins chat messages to one of them.
+func buzzMessage(t *testing.T, sk, tag, channel, mention, text string) *nostr.Event {
 	t.Helper()
-	tags := nostr.Tags{{"h", channel}}
+	tags := nostr.Tags{{tag, channel}}
 	if mention != "" {
 		tags = append(tags, nostr.Tag{"p", mention})
 	}

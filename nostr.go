@@ -169,17 +169,23 @@ func (n *nostrTransport) listen(ctx context.Context, a *Agent) {
 	pool := n.pools[a.Name]
 	filter := nostr.Filter{
 		Kinds: []int{messageKind},
-		Tags:  nostr.TagMap{"p": []string{a.PubKey}},
-		// No authors filter, deliberately. The allow list is the security
-		// boundary in receive, which checks it before decryption, but a relay
-		// that narrows by author would drop a blocked sender before it ever
-		// arrives — and then the refusal cannot be logged, so a sender who is
-		// simply not on the list looks exactly like a lost relay event.
-		// ponytail: extra fan-out for events the agent then refuses; a relay-side
-		// authors filter plus a periodic self-REQ is how to get both.
+		// The p tag is the addressing, not a narrowing: a kind-30078 envelope is
+		// a message to one agent, and the relay matches `#p` to decide who gets
+		// it. go-nostr applies the same filter client-side, so this is enforced
+		// twice and dropping it here would hand every agent on the relay every
+		// other agent's mail — receive() would decrypt it, because the
+		// conversation key comes from the sender and the agent, not from the tag.
+		// receive() checks the tag as well, so a client that does not tag `p` for
+		// this agent produces a log line instead of silence.
+		//
+		// `authors` must never go here, and neither may any other tag: a relay
+		// applies those before delivery, so nothing runs and nothing logs, and
+		// the only evidence is the relay's own view of a REQ. That cost a day for
+		// the allow list, which belongs in allows() and nowhere else.
 		// A small Since avoids replaying a fresh deployment's stored history
 		// into brand-new OpenCode sessions. ponytail: a few seconds of slack
 		// because relay clocks differ; a durable cursor is the upgrade.
+		Tags:  nostr.TagMap{"p": []string{a.PubKey}},
 		Since: ptr(nostr.Now() - 5),
 	}
 	interval := reconnectBase
