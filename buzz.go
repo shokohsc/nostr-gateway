@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -177,11 +178,19 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 		filter := nostr.Filter{
 			Kinds:   []int{buzzChatKind},
 			Tags:    nostr.TagMap{"h": ids},
-			Authors: a.Allow,
+			Authors: a.Allow, // ponytail: a membership change needs a restart or a config reload, log the count not the list
 			// The same 5s slack as the kind-30078 subscription: a longer Since
 			// would replay channel history into brand-new OpenCode sessions.
 			Since: ptr(nostr.Now() - 5),
 		}
+		// The REQ that carries this filter goes out on every refresh, but a
+		// refresh that changes nothing logs nothing, so a silent gateway is
+		// indistinguishable from a healthy one. Log what it last asked for:
+		// compared against the relay's own publish log, that is the difference
+		// between a message the relay never delivered and one the gateway
+		// refused (which buzzReceive logs).
+		n.log.Debug("buzz: asked for channel messages", "agent", a.Name,
+			"channels", len(ids), "authors", len(a.Allow), "relays", n.buzzRelays)
 		// The subscription gets its own context so a refresh can end it on the
 		// wire: go-nostr turns a cancelled context into a NIP-01 CLOSE, and
 		// leaving the old REQ open would keep the relay fanning out to a stale
@@ -282,15 +291,25 @@ func (n *nostrTransport) buzzReceive(ctx context.Context, a *Agent, ev *nostr.Ev
 	if ev.PubKey == a.PubKey {
 		return
 	}
+	// The two refusals below are configuration faults, not a message that was
+	// simply not addressed to the agent: either the sender's key is not in the
+	// allow list, or the channel it was sent in is not one the agent is a member
+	// of, and in both cases the agent is deaf until someone changes a file and
+	// restarts. So they log at Warn with the fix in the message. The two further
+	// down are ordinary group-chat traffic and stay at Debug — see drop.
 	if !a.allows(ev.PubKey) {
-		n.drop(a, ev, "sender is not on the allow list")
+		n.log.Warn("buzz: inbound message from a pubkey the agent does not allow",
+			"agent", a.Name, "from", shortPub(ev.PubKey), "allow", len(a.Allow),
+			"hint", "add this pubkey to the agent's allow list in AGENTS_FILE and restart, or the sender is deaf")
 		return
 	}
 	channel := ev.Tags.Find("h").Value()
 	members, member := chans[channel]
 	if !member {
-		n.drop(a, ev, "not a channel the agent is in")
-		return // not a channel the agent is in
+		n.log.Warn("buzz: inbound message in a channel the agent is not in",
+			"agent", a.Name, "channel", channel, "in", strings.Join(slices.Sorted(maps.Keys(chans)), ","),
+			"hint", "add the agent to that channel, or send in one it is in: a NIP-29 subscription only receives a channel it names in #h")
+		return
 	}
 	// In a two-member channel every message is addressed to the agent, which is
 	// what a DM is; in a group only a p tag for the agent is.
@@ -325,13 +344,15 @@ func (n *nostrTransport) buzzReceive(ctx context.Context, a *Agent, ev *nostr.Ev
 }
 
 // drop is what an inbound message that never became a prompt logs. Both
-// transports refuse messages before they are prompts — buzzReceive four ways,
-// nostr.receive on the allow list — and a refusal is silent by default, so a
-// configuration fault looks exactly like an agent that is ignoring its
-// senders. A stale allow list is the usual one, because a Buzz client mints its
-// key in the browser and a new browser is a new pubkey. Debug is the right
-// level: a group channel refuses most of what it carries, and the homelab
-// deployment runs LOG_LEVEL=debug anyway.
+// transports refuse messages before they are prompts — buzzReceive two ways
+// left, nostr.receive on the allow list — and a refusal is silent by default, so
+// a configuration fault looks exactly like an agent that is ignoring its
+// senders. The two configuration faults buzzReceive has are Warn with the fix in
+// the message; what is left here is a message that was simply not addressed to
+// the agent (no p tag in a group) or had nothing in it, which is ordinary
+// channel traffic, and a busy channel would drown a Warn in it. Debug, then: at
+// LOG_LEVEL=info a group channel stays quiet, and if a sender is being refused
+// for one of these reasons the answer is in the channel they can read.
 func (n *nostrTransport) drop(a *Agent, ev *nostr.Event, why string) {
 	n.log.Debug("inbound message not for this agent",
 		"agent", a.Name, "from", shortPub(ev.PubKey), "why", why)
