@@ -15,6 +15,14 @@ go test -run TestPermissionV2Server -v .      # one test; ./... is a single pack
 go build -o /tmp/gateway .                     # build outside the tree, do not litter
 ```
 
+The module targets Go 1.26 and the toolchain is pinned to a released 1.27.x, so
+CI installs whatever `go.mod` asks for. `.github/workflows/ci.yml` is the
+authoritative list of what has to pass: `gofmt`, `go build`, `go vet`, staticcheck
+(unused code — `go vet` does not look), `go mod tidy -diff`, `go test`,
+`go test -race`, govulncheck, and a `docker build`. Add the check there, not a
+third step in your head, and pin any tool version rather than using `@latest` so
+a new release cannot break main.
+
 `go test` and `go test -race` have different file sets: `nostr_test.go` carries
 `//go:build !race`, so `-race` skips it. Reason: go-nostr v0.52.3 has a data race
 in its own connect path (`relay.go:175` vs `relay.go:576`) that fires as soon as
@@ -130,11 +138,31 @@ that swallows its result makes the agent deaf with nothing in the log.
   goroutine's events must not land in an unbound conversation. Do not hoist the
   create call out of the lock; `TestConcurrentFirstMessageCreatesOneSession`
   covers it (4 sessions vs 1).
-- `sessionMap.index` must stay outside the conversation lock — taking both, in
-  the other order, deadlocks.
+- **The lock order is one-way: `c.mu` may be held while `m.mu` is taken, never the
+  reverse.** `ensureSession`'s closure calls `m.index` (`hub.go:248`) while it holds
+  `c.mu`, so the nesting `c.mu → m.mu` exists and is deliberate. Nothing takes
+  `m.mu` and then `c.mu`: `lookup`, `get`, `getHistory` and `byOpenCodeSession` all
+  return the `*conversation` and drop `m.mu` (`sessions.go:104-122`) before any
+  conversation method runs on it. A future change that holds `m.mu` across a
+  `c.*` call deadlocks; one that only ever nests `c.mu → m.mu` does not.
 - A conversation has one reply channel: the last inbound Nostr sender. Two
   allow-listed users on one conversation id is not a group chat, and the docs say
   so. Fixing that needs a reply-routing decision, not a patch.
+- `subscribe` registers the subscriber and snapshots its history **under one
+  `h.mu` hold**. They were two separate steps, and `emit` records into the
+  conversation and then pushes under `h.mu`, so an event landing in that gap was
+  dropped for that subscriber with no error anywhere. Do not split them back out
+  to "avoid holding the lock longer".
+- `buzzJob` runs on the single publish `worker` goroutine that serves every
+  agent, so a panic there is a process crash, not a failed message. Every
+  `n.turns[...]` read in it must tolerate the entry being absent: a turn reaches
+  `completed` with nothing accumulated whenever it errored before its first delta
+  or a `permission_request` posted on its own and took the turn with it, and
+  `*strings.Builder.String()` dereferences its own fields. `TestBuzzJobCompletesATurnThatNeverAccumulated`
+  is the guard.
+- Every relay call on a listener's own goroutine carries `callTimeout`. A
+  `context.Background()` publish to a relay that never answers stalls that
+  agent's entire inbound stream — the listener is the only reader.
 
 ## OpenCode compatibility
 

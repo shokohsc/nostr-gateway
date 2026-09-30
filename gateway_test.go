@@ -856,3 +856,53 @@ func TestDeltaThenSnapshotDoesNotDouble(t *testing.T) {
 		t.Fatalf("snapshot after deltas emitted %+v", got)
 	}
 }
+
+// buzzJob runs on the one goroutine that publishes for every agent, so a turn
+// reaching `completed` with nothing accumulated is a process crash, not a failed
+// message: *strings.Builder dereferences its own fields. Two real turns get
+// there — one that errors before its first delta, and one whose permission
+// request posts on its own and clears the turn on the way out. The first job in
+// each pair needs a buzz pool to post into, and neither posts anything, so this
+// runs without a relay.
+func TestBuzzJobCompletesATurnThatNeverAccumulated(t *testing.T) {
+	agent := &Agent{Name: "frontend-agent", PubKey: strings.Repeat("ab", 32), sk: nostr.GeneratePrivateKey(), ck: map[string][32]byte{}}
+	// A pool with no relays: signing still runs, publishing resolves immediately.
+	nt := &nostrTransport{
+		turns:     map[string]*strings.Builder{},
+		buzzPools: map[string]*nostr.SimplePool{agent.Name: nostr.NewSimplePool(context.Background())},
+	}
+	conv := buzzConversation("channel-dm")
+	job := func(typ, text string) job {
+		return job{agent: agent, buzz: "channel-dm", env: Envelope{Conversation: conv, Type: typ, Payload: Payload{Text: text}}}
+	}
+
+	// A turn that produced no text of its own.
+	if err := nt.buzzJob(context.Background(), job(TypeCompleted, "")); err != nil {
+		t.Fatalf("empty completed turn: %v", err)
+	}
+	// A permission request posts on its own and takes the accumulated turn with
+	// it, so the turn that follows also completes with nothing in hand.
+	if err := nt.buzzJob(context.Background(), job(TypeMessage, "half an answer")); err != nil {
+		t.Fatalf("delta: %v", err)
+	}
+	if err := nt.buzzJob(context.Background(), job(TypePermissionReq, "may I?")); err != nil {
+		t.Fatalf("permission request: %v", err)
+	}
+	if err := nt.buzzJob(context.Background(), job(TypeCompleted, "")); err != nil {
+		t.Fatalf("completed after a permission request: %v", err)
+	}
+	// An error discards the partial turn rather than posting it, and leaves no
+	// entry behind for the completed that follows to trip over.
+	if err := nt.buzzJob(context.Background(), job(TypeMessage, "half an answer")); err != nil {
+		t.Fatalf("delta: %v", err)
+	}
+	if err := nt.buzzJob(context.Background(), job(TypeError, "")); err != nil {
+		t.Fatalf("empty error: %v", err)
+	}
+	if err := nt.buzzJob(context.Background(), job(TypeCompleted, "")); err != nil {
+		t.Fatalf("completed after an error: %v", err)
+	}
+	if len(nt.turns) != 0 {
+		t.Fatalf("in-flight turns left behind: %v", nt.turns)
+	}
+}

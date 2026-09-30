@@ -270,9 +270,12 @@ func (n *nostrTransport) send(a *Agent, peer string, env Envelope) error {
 }
 
 // reply sends one envelope straight out, bypassing the ordered queue: it is a
-// terminal answer to a message that will produce nothing else.
+// terminal answer to a message that will produce nothing else. The deadline is
+// the point — this runs on the listener goroutine, so a publish with no deadline
+// is a relay that never answers holding that agent's inbound stream open.
 func (n *nostrTransport) reply(a *Agent, peer string, env Envelope) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
 	var err error
 	if channel, ok := buzzChannelOf(env.Conversation); ok && n.buzzPools[a.Name] != nil {
 		err = n.buzzPost(ctx, a, channel, peer, env.Payload.Text)
@@ -323,6 +326,16 @@ func (n *nostrTransport) publish(ctx context.Context, a *Agent, peer string, env
 		}
 	}
 	return firstErr
+}
+
+// tagValue is Tags.Find + Tag.Value, which go-nostr has deprecated in favour of
+// writing the indexing inline. Find already guarantees a two-element tag, so the
+// only thing worth keeping is the empty case.
+func tagValue(tags nostr.Tags, key string) string {
+	if t := tags.Find(key); t != nil {
+		return t[1]
+	}
+	return ""
 }
 
 func ptr[T any](v T) *T { return &v }

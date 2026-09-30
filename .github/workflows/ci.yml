@@ -16,10 +16,11 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+
       # `gofmt -l` exits 0 even when it lists files, so check the output.
       - name: gofmt
         run: |
@@ -29,6 +30,37 @@ jobs:
             echo "$unformatted"
             exit 1
           fi
+
+      - run: go build ./...
       - run: go vet ./...
+
+      # The only check that sees unused code. `go vet` does not, and U1000 is
+      # what keeps a 4000-line package from accreting dead helpers.
+      # Pinned, not @latest: a new release must not be able to break the build.
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2026.2.1 ./...
+
+      # `go get -u` adds go.sum lines it does not prune and leaves indirect
+      # requirements behind, so the drift is real rather than theoretical.
+      - name: go mod tidy
+        run: |
+          go mod tidy -diff || {
+            echo "::error::go.mod/go.sum are not tidy; run 'go mod tidy'"
+            exit 1
+          }
+
+      # nostr_test.go is //go:build !race (go-nostr v0.52.3 has an upstream data
+      # race in its connect path), so this run covers the Nostr path and the
+      # one below covers everything else.
       - run: go test ./...
       - run: go test -race ./...
+
+      # The gateway dials HTTPS to OpenCode and to the Nostr relays on every
+      # message, so stdlib CVEs are on its hot path, not theoretical.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+      # image.yaml builds this on every push to main. A Dockerfile that stopped
+      # building would otherwise only be discovered after merging.
+      - name: docker build
+        run: docker build --tag gateway:ci .

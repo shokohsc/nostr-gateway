@@ -303,7 +303,7 @@ func (n *nostrTransport) buzzReceive(ctx context.Context, a *Agent, ev *nostr.Ev
 			"hint", "add this pubkey to the agent's allow list in AGENTS_FILE and restart, or the sender is deaf")
 		return
 	}
-	channel := ev.Tags.Find("h").Value()
+	channel := tagValue(ev.Tags, "h")
 	members, member := chans[channel]
 	if !member {
 		n.log.Warn("buzz: inbound message in a channel the agent is not in",
@@ -394,10 +394,21 @@ func (n *nostrTransport) buzzJob(ctx context.Context, j job) error {
 		t.WriteString(j.env.Payload.Text)
 		return nil
 	case TypeCompleted:
-		return post(n.turns[j.env.Conversation].String())
+		// The entry is often absent, and *strings.Builder dereferences its own
+		// fields, so reading it unguarded kills the process from the one
+		// goroutine that publishes for every agent. A turn reaches here with
+		// nothing accumulated whenever it produced no text of its own — an
+		// error before the first delta, or a permission request, which posts on
+		// its own and clears the turn on its way out.
+		if t := n.turns[j.env.Conversation]; t != nil {
+			return post(t.String())
+		}
+		return nil
 	case TypeError:
-		// Whatever the turn said so far, the error is what matters now.
-		n.turns[j.env.Conversation] = nil
+		// Whatever the turn said so far, the error is what matters now. Deleted
+		// rather than nil'd: an empty error leaves post's own delete unreached,
+		// and the nil entry would outlive the turn in the map forever.
+		delete(n.turns, j.env.Conversation)
 		return post(j.env.Payload.Text)
 	case TypePermissionReq:
 		// Asked in its own message, because it is its own decision. Answering it

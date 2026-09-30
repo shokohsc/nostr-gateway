@@ -1,6 +1,6 @@
 # Nostr gateway for KubeOpenCode agents — one central deployment.
 #
-# Plan: docs/plan.md §3-§5. The gateway is a separate Deployment because the
+# Plan: plan.md §3-§5. The gateway is a separate Deployment because the
 # KubeOpenCode Agent CRD has no documented sidecar field (plan option B), and
 # one gateway can serve every agent in the namespace.
 #
@@ -95,10 +95,25 @@ spec:
       labels:
         app: nostr-gateway
     spec:
+      # The gateway needs no Kubernetes API access: it reads its config from an
+      # env var and talks to OpenCode and the Nostr relays directly.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532 # distroless nonroot
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: gateway
           image: ghcr.io/example/nostr-gateway:latest
           args: []
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
           env:
             - name: AGENTS_FILE
               value: /etc/gateway/agents.json
@@ -136,6 +151,7 @@ spec:
               cpu: 50m
               memory: 64Mi
             limits:
+              cpu: 500m
               memory: 256Mi
           volumeMounts:
             - name: config

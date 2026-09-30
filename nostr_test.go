@@ -233,7 +233,7 @@ const authChallenge = "nostr-gateway-test-challenge"
 // the connection to the key that signed it.
 func (r *fakeRelay) verify(c *relayConn, ev *nostr.Event) bool {
 	if _, err := ev.CheckSignature(); err != nil ||
-		ev.Tags.Find("challenge").Value() != authChallenge ||
+		tagValue(ev.Tags, "challenge") != authChallenge ||
 		ev.Content != "" {
 		return false
 	}
@@ -418,7 +418,7 @@ func TestNostrRoundTrip(t *testing.T) {
 	if ev.Kind != messageKind {
 		t.Fatalf("kind %d", ev.Kind)
 	}
-	if got := ev.Tags.Find("p").Value(); got != upk {
+	if got := tagValue(ev.Tags, "p"); got != upk {
 		t.Fatalf("p tag %q, want %q", got, upk)
 	}
 	if strings.Contains(ev.Content, "hello") {
@@ -797,7 +797,7 @@ func TestBuzzAnswerIsPostedBackIntoTheChannel(t *testing.T) {
 	if post.PubKey != apk {
 		t.Fatalf("posted by %s, want the agent's own key %s", shortPub(post.PubKey), shortPub(apk))
 	}
-	if channel := post.Tags.Find("h").Value(); channel != dm {
+	if channel := tagValue(post.Tags, "h"); channel != dm {
 		t.Fatalf("h tag %q, want channel %q", channel, dm)
 	}
 	upk, _ := nostr.GetPublicKey(usk)

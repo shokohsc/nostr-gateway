@@ -1,3 +1,10 @@
+> **Superseded.** This is the original design document, kept for the reasoning
+> behind the architecture. It is *not* the spec: things were added and changed
+> while building it (the Buzz transport, the OpenAI-compatible HTTP surface,
+> permission handling for both OpenCode API generations, several rounds of
+> making the silence visible in the logs). `README.md` is the reference; where
+> the two disagree, `README.md` and the code win.
+
 Yes. The clean architecture is to treat **Nostr as the external messaging/event transport**, and keep **OpenCode completely HTTP-based**.
 
 OpenCode already exposes a headless HTTP API and an SSE event stream, so there is no reason to put `stdio` between the agent and your bridge. ([OpenCode][1])

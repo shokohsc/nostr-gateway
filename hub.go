@@ -141,19 +141,24 @@ func (h *hub) emit(c *conversation, a *Agent, r reduced) Envelope {
 // subscribe returns a stream of a conversation's events, starting with the
 // replay buffer, so a client that subscribes after its first message still sees
 // the beginning of the answer.
+//
+// Registering and reading the replay buffer happen under one lock, which is the
+// only order that delivers every event exactly once: emit records into the
+// history and only then pushes to the subscribers, so an emit that lands before
+// this lock is in the snapshot and one that lands after it is on the channel.
 func (h *hub) subscribe(convID string) (<-chan Envelope, func()) {
 	ch := make(chan Envelope, 256)
+	h.mu.Lock()
+	if h.subs[convID] == nil {
+		h.subs[convID] = map[chan Envelope]struct{}{}
+	}
+	h.subs[convID][ch] = struct{}{}
 	for _, e := range h.convs.getHistory(convID) {
 		select {
 		case ch <- e:
 		default:
 		}
 	}
-	h.mu.Lock()
-	if h.subs[convID] == nil {
-		h.subs[convID] = map[chan Envelope]struct{}{}
-	}
-	h.subs[convID][ch] = struct{}{}
 	h.mu.Unlock()
 	return ch, func() {
 		h.mu.Lock()

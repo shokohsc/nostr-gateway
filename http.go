@@ -350,6 +350,12 @@ func (h *hub) serveHTTP(ctx context.Context, addr, token string) error {
 		Addr:              addr,
 		Handler:           h.handler(token),
 		ReadHeaderTimeout: 10 * time.Second,
+		// No ReadTimeout or WriteTimeout: both would cut a conversation's SSE
+		// stream, which is supposed to outlive any request deadline. IdleTimeout
+		// only applies between requests on a kept-alive connection, so it reaps
+		// sockets that are held open and idle — the one leak a plain timeout
+		// would not have fixed.
+		IdleTimeout: 120 * time.Second,
 	}
 	go func() {
 		<-ctx.Done()

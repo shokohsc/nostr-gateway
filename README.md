@@ -2,9 +2,11 @@
 
 Talks to [KubeOpenCode](https://opencode.ai/docs/server) agents over Nostr, and to
 anyone else over plain HTTP. One process, one small JSON protocol, every transport
-swappable — Mattermost or a webhook only has to call `hub.Handle` to join in.
+swappable — a new transport only has to call `hub.Handle` and `hub.emit` to join in,
+and both are the sole place any transport meets the others.
 
-Implements plan.md.
+`plan.md` is the original spec this was built from. Where the two disagree, the code
+and this file win.
 
 ## What it does
 
@@ -49,7 +51,9 @@ curl -sS localhost:8080/v1/chat/completions \
 #  "choices":[{"message":{"role":"assistant","content":"…"}}],
 #  "conversation":"oai-alice", ...}
 
-curl -N -sS localhost:8080/v1/chat/completions -d '{"model":"…","stream":true,"messages":[…]}'
+curl -N -sS localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_TOKEN" \
+  -d '{"model":"…","stream":true,"messages":[…]}'
 # data: {"object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"}}], …}
 # data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"the "}}], …}
 # data: [DONE]
@@ -135,7 +139,7 @@ the same.
 | `NOSTR_RELAYS` | `wss://nos.lol,wss://relay.damus.io` | Comma-separated relay URLs |
 | `BUZZ_RELAYS` | unset | Comma-separated Buzz relay URLs. Set it and each agent joins the Buzz channels it is a member of, answers mentions in the channel, and publishes its agent profile. A relay may be named in both this and `NOSTR_RELAYS`: Buzz gets its own connection either way |
 | `GATEWAY_ADDR` | `:8080` | HTTP listen address |
-| `GATEWAY_TOKEN` | unset | Bearer token for the HTTP API; unset disables auth |
+| `GATEWAY_TOKEN` | unset | Bearer token for the HTTP API. **Unset means the HTTP API is open to anything that can reach it**, so the gateway logs a warning at startup. An empty `allow` list has the same consequence on the Nostr path |
 | `OPENCODE_USER` / `OPENCODE_PASSWORD` | unset | Basic auth for OpenCode servers that require it |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 
@@ -288,6 +292,18 @@ republishes under its own protocol.
 
 - Conversations live in memory. A restart drops the conversation→session map and
   dedupe state; agents start fresh conversations. Persist the map if that matters.
+- Conversation ids are one namespace across every transport, and
+  `/v1/chat/completions` derives one from the client-chosen `user` field, so an
+  allow-listed Nostr peer can send `"conversation":"oai-alice"` and join an HTTP
+  caller's conversation — and the gateway will then address its replies to that
+  peer. The cause is the single shared `GATEWAY_TOKEN`: every HTTP caller is one
+  trust domain, so there is no per-caller identity to namespace with. Per-caller
+  tokens are the fix; until then, do not run the HTTP API and a shared Nostr
+  relay for agents that must not see each other's traffic.
+- Nothing evicts. Every invented `conversation` id costs a permanent map entry
+  *and* a real OpenCode session on the agent's backend, so an unauthenticated
+  caller (or a `GATEWAY_TOKEN`-holder inventing ids) can spend agent quota with
+  one request per id. There is no rate limit and no cap either.
 - The Nostr subscription only looks 5 seconds back, so a gateway restart misses
   messages sent while it was down. Same for a Buzz channel subscription.
 - Buzz carries the answer back as a kind `9` in the channel, but only the answer:
@@ -310,7 +326,10 @@ republishes under its own protocol.
   `Relay.close` reads it, `relay.go:175` vs `relay.go:576`) that fires as soon as
   the pool subscribes, and it is the latest published version. The rest of the
   suite is race-clean; the Nostr tests run in the normal suite.
-- Tool output is sent whole (capped at 32 MB per event) and not truncated.
+- Tool output is sent whole (capped at 32 MB per event) and not truncated. The cap
+  bounds what the stream does, not what it allocates: the oversized line is read
+  before it is measured. OpenCode is a cluster-internal peer, so this is a note
+  rather than a boundary you can hit from outside.
 - `model` and `opencode_agent` are global per agent, not per conversation, and
   not per request: an OpenAI `model` picks the agent, never the model behind it.
 - The OpenAI surface cannot express a tool call, a progress event or a permission
@@ -342,6 +361,7 @@ streamed answer assembled into one kind-9 channel message with nothing published
 to `NOSTR_RELAYS`, the agent not answering its own channel replies, a Buzz
 discovery recovering from a refused NIP-42 handshake, a Buzz discovery on a relay
 that is also a `NOSTR_RELAYS` entry, the agent profile published before the agent
-is in any channel, and a full Nostr round trip
+is in any channel, a Buzz turn that reaches `completed` with nothing accumulated
+without taking the process down, and a full Nostr round trip
 (NIP-44, kind, `p` tag routing, encrypted reply) against an in-process fake relay,
 including a relay that demands NIP-42 and authenticates each agent separately.
