@@ -174,12 +174,18 @@ export BUZZ_RELAYS='ws://buzz.example.internal:3000'
   channel, so the agent's channels are discovered first, from the NIP-29 member
   lists (kind `39002`) the agent's own pubkey appears in. Membership is re-read
   every minute, so a channel the agent was added to later needs no restart.
-- That `#h` narrowing is **not** put in the subscription. A relay applies it
-  before delivering, so an event tagged with anything other than `h` — a `d` tag,
-  which is the name the NIP-29 member lists themselves use for the same value —
-  would be dropped by the relay and the mention would vanish with nothing logged.
-  The gateway reads the channel from `h` or `d`, checks membership itself, and
-  logs the refusal, so the fan-out of every kind-9 on the relay is paid instead.
+- That discovered list **is** the `#h` filter on the kind-9 subscription, because
+  omitting it does not widen what the agent hears, it ends it: the relay delivers
+  a channel message only to subscriptions naming that channel, so a REQ with kinds
+  and nothing else receives none of them, with a clean log on both sides — the
+  relay reports the message ingested and the gateway has nothing to say about an
+  event that never arrived. `h` is the name NIP-29 gives a channel on a chat
+  message and the name the agent's own answers carry, so it is the one the relay
+  routes on. The gateway still reads the channel from `h` or `d` and checks
+  membership itself, so nothing about *whether to answer* moves into the filter.
+- Nothing the gateway decides goes into a filter, `authors` included: a blocked
+  sender dropped by the relay never reaches the `allow` check that would have
+  named it. That decision, and the mention check, are logged where they happen.
 - A discovery has three outcomes, and they are logged apart because their fixes
   are opposites. No member lists at all is re-asked a few seconds later, since
   that is what a lost NIP-42 handshake looks like (see `AGENTS.md`) rather than

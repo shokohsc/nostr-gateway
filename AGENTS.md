@@ -126,18 +126,32 @@ that swallows its result makes the agent deaf with nothing in the log.
   prove delivery. Note that the fake relay ignores filters entirely — the REQ
   handler replays every stored event to every subscriber — so it can only catch a
   filter that was never sent, never one the relay would honour.
-- **That is the whole rule, not just `authors`: the only tag filter the gateway
-  may send is the `p` that addresses an envelope.** `buzzListen` also used to send
-  `Tags: {"h": ids}` and that is the same bug wearing a different hat — the relay
-  drops a kind-9 that carries `d` instead of `h` (the name NIP-29's own member
-  lists use for the same value) before the gateway's membership check can log
-  anything. So `buzzChannelTag` accepts `h` or `d` and `buzzReceive` does the
-  membership check. Do not "optimise" either filter back. The exception is real
-  and is not an optimisation: `#p` is addressing, not narrowing, and two layers
-  enforce it (the REQ and go-nostr's client-side `Filter.Matches`, which does run —
-  verified, do not re-derive this by grepping for `Matches` outside `filter.go`).
+- **The rule is: a filter may address, never adjudicate. `authors` is out; the two
+  tags the relays themselves route on stay.** A relay applies `authors` and every
+  `#tag` before it delivers, so anything the gateway *decides* with in a filter is
+  a refusal it can never log. Two tags are the exception and are not an
+  optimisation, because the relay delivers on them and omitting one does not widen
+  delivery, it ends it:
+  - `#p` on the kind-30078 listener, enforced twice (the REQ and go-nostr's
+    client-side `Filter.Matches`, which does run — verified, do not re-derive this
+    by grepping for `Matches` outside `filter.go`).
+  - `#h` on the kind-9 listener, listing every channel `buzzDiscover` found. Buzz's
+    relay hands a channel message only to the subscriptions that **name** that
+    channel, so a REQ with kinds alone receives none of them. `buzzListen` used to
+    send `h` and it was removed as "a guess at Buzz's tag convention that
+    buzzDiscover contradicts" — and that removal made an agent deaf in every
+    channel it was a member of, with the cleanest log in the system: the relay
+    reported the message ingested, the gateway logged nothing, and no amount of
+    debugging the *processing* could have found it because nothing was processed.
+    `h` is what NIP-29 puts on a chat message and what `buzzPost` publishes, so it
+    is the name the relay routes on. Asking for `h` costs nothing on a relay that
+    used `d`: such a relay could not route those messages to a channel-scoped
+    subscription either. `buzzChannelTag` still accepts `h` or `d` and
+    `buzzReceive` still does the membership check.
   `TestGatewayNeverAsksTheRelayToFilter` and `TestNostrRoutesByPTag` are the two
-  guards, and between them they cover both halves.
+  guards, and between them they cover both halves — the first also asserts the
+  kind-9 REQ names the discovered channel, so the deafness cannot come back as
+  an empty list.
 - **Keys are normalised to hex exactly once**, in `loadRegistry`. A bech32 pubkey
   reaching go-nostr produces a `p` tag filter that never matches a real relay —
   the agent goes silently deaf, with no error anywhere. `TestNostrRoutesByPTag`

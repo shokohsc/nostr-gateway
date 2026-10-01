@@ -73,10 +73,14 @@ func buzzConversation(channel string) string { return buzzConvPrefix + channel }
 // member lists name it in `d` (buzzDiscover reads it from there and that is how
 // the channel list is built) and chat messages are written in `h` (buzzPost), so
 // the gateway itself uses both, and nothing in the protocol says which one a
-// Buzz chat message carries. Resolving both is what lets a message through on a
-// relay that picked the other one — the previous behaviour filtered the
-// subscription by `h` as well, so a `d`-only message never arrived to be
-// misread. Returns "" when neither is present, which buzzReceive logs.
+// Buzz chat message carries. Resolving both is what lets a delivered message be
+// addressed whichever tag its author used. Resolving both was also what the old
+// comment claimed was sufficient, and it is not: the kind-9 REQ names the
+// channel under `h` because Buzz's relay delivers a channel message only to
+// subscriptions that name it (see buzzListen), so a `d`-only chat message is
+// dropped by the relay and then by go-nostr's client-side match, before it gets
+// here. Leaving the tag off the filter instead is not the fix for that — it
+// loses every channel message there is, silently.
 func buzzChannelTag(tags nostr.Tags) string {
 	if c := tagValue(tags, "h"); c != "" {
 		return c
@@ -192,20 +196,34 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 
 		filter := nostr.Filter{
 			Kinds: []int{buzzChatKind},
-			// Kinds and nothing else, deliberately: see nostr.listen. This used
-			// to carry `#h: <the discovered channels>`, which is a guess at
-			// Buzz's tag convention that buzzDiscover itself contradicts — it
-			// reads the channel id off the `d` tag of the kind-39002 member
-			// list. A relay applies `#h` before delivery, so if Buzz names the
-			// channel anything else on a chat message the agent is deaf in every
-			// channel with nothing logged, and nothing in the protocol pins the
-			// choice. buzzReceive resolves both names instead, and a channel it
-			// cannot resolve is logged, so the convention becomes visible instead
-			// of fatal.
-			// ponytail: fan-out for every kind-9 on the relay for a minute at a
-			// time, which the gateway then drops as not-a-member. A relay serving
-			// many channels makes that costly; a periodic self-REQ to prove
-			// delivery buys the narrowing back.
+			// The channels the agent is a member of, and nothing else: see the
+			// `#h` note below.
+			Tags: nostr.TagMap{"h": ids},
+			// This is addressing, not narrowing, and the difference is the whole
+			// bug it fixes. Buzz's relay fans a channel message out per
+			// subscription and hands it to the subscriptions that *name* that
+			// channel, so a kind-9 REQ with only `kinds` receives nothing at all
+			// — not the wrong channels, none: the agent is deaf in every channel
+			// while the relay logs the message as ingested and the gateway logs
+			// nothing, because nothing arrived to be refused. This is why
+			// discovery runs first (ids is what it returned) and why removing
+			// this tag "because it is only a guess" was the wrong call.
+			//
+			// `h` is the name NIP-29 gives a channel on a kind-9 chat message,
+			// and it is what buzzPost writes, so a message this relay routes
+			// carries it. The `d` tolerance is not lost by asking for `h`:
+			// buzzChannelTag still reads either name gateway-side, which is what
+			// covers a relay that publishes chats under `d` — a relay that did
+			// would also be unable to route those messages to a channel-scoped
+			// subscription at all, so the filter costs nothing there.
+			//
+			// What still never goes in a filter: `authors`, and any tag the
+			// gateway would otherwise use to decide something. allow, membership
+			// and the mention are all decided in buzzReceive, where a refusal can
+			// be logged. See AGENTS.md, and the same rule on nostr.listen.
+			// ponytail: one REQ per refresh covering every channel the agent is
+			// in; per-channel REQs buy nothing, because the answer is filtered
+			// by channel anyway.
 			// The same 5s slack as the kind-30078 subscription: a longer Since
 			// would replay channel history into brand-new OpenCode sessions.
 			Since: ptr(nostr.Now() - 5),
