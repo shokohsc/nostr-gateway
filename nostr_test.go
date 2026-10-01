@@ -946,12 +946,27 @@ func TestBuzzAnswerIsPostedBackIntoTheChannel(t *testing.T) {
 
 	waitFor(t, "the mention to reach OpenCode", func() bool { _, p, _ := f.counts(); return p == 1 })
 
+	// OpenCode streams the prompt back as its own message before the model runs:
+	// a `message.updated` carrying the role, then the text the gateway just sent
+	// as a text part of that message. Nothing on the part says whose it is — the
+	// user message's part and the assistant's are the same shape — so a reducer
+	// that reads parts alone posts the human's own words back into the channel.
+	f.push("message.updated", map[string]any{
+		"sessionID": "ses_1",
+		"info":      map[string]any{"id": "msg_usr", "sessionID": "ses_1", "role": "user"},
+	})
+	f.push("message.part.updated", map[string]any{
+		"sessionID": "ses_1", "delta": "@frontend-agent hello",
+		"part": map[string]any{"id": "prt_0", "type": "text", "sessionID": "ses_1",
+			"messageID": "msg_usr", "text": "@frontend-agent hello"},
+	})
+
 	// The answer streams in as deltas, so the gateway has to assemble it rather
 	// than post one message per delta.
 	part := func(delta string) {
 		f.push("message.part.updated", map[string]any{
 			"sessionID": "ses_1", "delta": delta,
-			"part": map[string]any{"id": "prt_1", "type": "text", "sessionID": "ses_1"},
+			"part": map[string]any{"id": "prt_1", "type": "text", "sessionID": "ses_1", "messageID": "msg_asst"},
 		})
 	}
 	part("on it, ")

@@ -45,6 +45,9 @@ type eventProps struct {
 	Delta     string `json:"delta"`
 	ID        string `json:"id"`
 	Title     string `json:"title"`
+	// message.updated carries the message itself, which is the only thing on the
+	// wire that says whether a part belongs to the human or to the agent.
+	Info *message `json:"info"`
 	// Permission ids were called permissionID with a `response` value, and are
 	// now requestID with a `reply` value. Both spellings are in the wild.
 	PermissionID string          `json:"permissionID"`
@@ -53,6 +56,13 @@ type eventProps struct {
 	Reply        string          `json:"reply"`
 	Status       string          `json:"status"`
 	Error        json.RawMessage `json:"error"`
+}
+
+// message is UserMessage | AssistantMessage, discriminated on role.
+type message struct {
+	ID        string `json:"id"`
+	SessionID string `json:"sessionID"`
+	Role      string `json:"role"`
 }
 
 func (p eventProps) permission() (id, reply string) {
@@ -67,7 +77,10 @@ func (p eventProps) permission() (id, reply string) {
 }
 
 type part struct {
-	ID        string `json:"id"`
+	ID string `json:"id"`
+	// The message this part belongs to. A text part says nothing about who wrote
+	// it, so this is the only way back to the role.
+	MessageID string `json:"messageID"`
 	Type      string `json:"type"`
 	SessionID string `json:"sessionID"`
 	CallID    string `json:"callID"`

@@ -218,6 +218,20 @@ failure whose text happens to contain "404" also falls back. Removing either
 generation breaks a real OpenCode version. `session.status: idle` is the
 completion signal on newer builds; older ones send `session.idle`.
 
+`message.part.updated` does not say who wrote the part: a text part is
+`{id, messageID, type, text, sessionID}`, and the human's own prompt comes back
+through that same event because OpenCode stores the prompt as a message of its
+own before the model runs. Only `message.updated` carries `info.role`. A reducer
+that reads parts alone turns the prompt into the answer — Buzz posted
+`@frontend-agent helloon it, one sec`, and every SSE and kind-30078 subscriber
+saw the human's own words come back as a `message`. `reduceEvent` records
+`user:<messageID>` in the conversation's `seen` set from `message.updated` and
+`reducePart` drops those parts; a message id whose role never arrived counts as
+the agent's, because losing an answer is worse than showing a prompt.
+`TestBuzzAnswerIsPostedBackIntoTheChannel` is the guard, and it pushes the prompt
+back as a user message first — a fake that only emits assistant parts cannot see
+this bug at all.
+
 Other numbers that are deliberate, not arbitrary: `maxEventBytes` 32 MB per SSE
 line (an oversized line is dropped, the stream survives), `callTimeout` 30 s on
 every non-streaming call (the event stream is deliberately unbounded),

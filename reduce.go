@@ -29,8 +29,8 @@ func sessionOf(ev opencodeEvent) string {
 }
 
 // reduceEvent collapses OpenCode's event stream onto the agent protocol. `seen`
-// dedupes per session: OpenCode re-sends the full part on every update, so
-// without a delta we would repeat the text once per update.
+// is the conversation's dedupe set, and it is also where the reducer remembers
+// which messages are the human's — see the message.updated case.
 //
 // ponytail: `seen` is in-memory, so a gateway restart could replay one event
 // from a relay. Harmless (duplicates are dropped downstream by event id); move
@@ -42,6 +42,25 @@ func reduceEvent(ev opencodeEvent, seen map[string]bool) []reduced {
 	}
 
 	switch ev.Type {
+	case "message.updated":
+		// Nothing to emit, but the most important thing on the wire. OpenCode
+		// streams the prompt back as a message of its own before the model runs,
+		// and its text part is the same shape as the assistant's — id, type,
+		// text, sessionID — with nothing to say whose it is. A reducer that reads
+		// parts alone therefore treats the human's own words as the answer: Buzz
+		// posted "@frontend-agent helloon it, one sec", and every subscriber on
+		// every transport saw the prompt come back as a message. The role lives on
+		// the message, so this is the only place it can be read.
+		//
+		// Only the user role is recorded. An unknown message id means the role
+		// never arrived — a build that does not send this event, or a stream that
+		// started mid-turn — and the part is then treated as the agent's, which is
+		// how it behaved before: losing an answer is worse than showing a prompt.
+		if p.Info != nil && p.Info.Role == "user" && p.Info.ID != "" {
+			seen[userKey(p.Info.ID)] = true
+		}
+		return nil
+
 	case "message.part.updated":
 		if p.Part == nil {
 			return nil
@@ -89,6 +108,12 @@ func reduceEvent(ev opencodeEvent, seen map[string]bool) []reduced {
 }
 
 func reducePart(pt part, delta string, seen map[string]bool) []reduced {
+	// The human's own text, streamed back by OpenCode. Nothing downstream wants
+	// it: a Buzz answer is one message with the agent's words in it, and a
+	// subscriber already has the prompt.
+	if pt.MessageID != "" && seen[userKey(pt.MessageID)] {
+		return nil
+	}
 	switch pt.Type {
 	case "text", "reasoning":
 		typ := TypeMessage
@@ -137,6 +162,10 @@ func reducePart(pt part, delta string, seen map[string]bool) []reduced {
 		return nil // step-start/step-finish/retry/... carry no protocol meaning
 	}
 }
+
+// userKey namespaces the message ids remembered in a conversation's dedupe set,
+// next to the "perm:", "stream:", "tool:" keys already in there.
+func userKey(messageID string) string { return "user:" + messageID }
 
 // errorText renders OpenCode's error field, which may be a string or an object.
 func errorText(raw json.RawMessage) string {
