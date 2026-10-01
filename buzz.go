@@ -451,6 +451,10 @@ func (n *nostrTransport) buzzJob(ctx context.Context, j job) error {
 	post := func(text string) error {
 		text = strings.TrimSpace(text)
 		if text == "" {
+			// Logged, because the alternative is a mention answered with nothing
+			// and a clean log: the reducer dropped the answer, and this is the
+			// last place that still knows the turn ended without one.
+			n.log.Warn("buzz: turn ended with nothing to post", "agent", j.agent, "conversation", j.env.Conversation)
 			return nil
 		}
 		delete(n.turns, j.env.Conversation)

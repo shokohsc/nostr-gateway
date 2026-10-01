@@ -11,7 +11,7 @@ type conversation struct {
 	Agent   string
 	session string // OpenCode session id, "" until the first message
 	peer    string // hex pubkey of the Nostr participant, "" for pure HTTP
-	seen    map[string]bool
+	seen    map[string]int
 	history []Envelope // last few events, replayed to late SSE subscribers
 }
 
@@ -106,7 +106,7 @@ func (m *sessionMap) lookup(convID, agent string) *conversation {
 	defer m.mu.Unlock()
 	c, ok := m.byConv[convID]
 	if !ok {
-		c = &conversation{ID: convID, Agent: agent, seen: map[string]bool{}}
+		c = &conversation{ID: convID, Agent: agent, seen: map[string]int{}}
 		m.byConv[convID] = c
 	}
 	return c

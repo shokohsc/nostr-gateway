@@ -233,8 +233,20 @@ Two API generations are live in the wild and both are handled on purpose:
 `replyPermission` tries the legacy endpoint and falls back on 404/405 — matched by
 string search in `isMissingRoute`, not by a typed status error, so a non-404
 failure whose text happens to contain "404" also falls back. Removing either
-generation breaks a real OpenCode version. `session.status: idle` is the
-completion signal on newer builds; older ones send `session.idle`.
+generation breaks a real OpenCode version. `session.status` with an `idle` status
+is the completion signal on newer builds; older ones send `session.idle`.
+
+The `status` value is an **object** on every current OpenCode — `{"type":"idle"}` —
+and a bare string on older ones. It is therefore `json.RawMessage` in `eventProps`,
+read by `statusName`. It cannot be a typed `string`: `reduceEvent` unmarshals
+`properties` once into `eventProps` and returns `nil` on any error without logging,
+so one field whose type does not match takes the *entire* event down, silently. A
+turn that never sees a completion event never accumulates anything, so the Buzz
+channel gets no reply and the log stays clean — which is exactly what happened.
+When in doubt about a shape here, capture it from a real server rather than inferring
+it: `opencode serve --port <p>`, `POST /session/<id>/prompt_async`, then read
+`/global/event`. The table test was wrong for a long time because it hand-wrote
+`"status": "idle"`; `TestReduceEvent` now carries both real shapes plus `busy`.
 
 `message.part.updated` does not say who wrote the part: a text part is
 `{id, messageID, type, text, sessionID}`, and the human's own prompt comes back
@@ -249,6 +261,21 @@ the agent's, because losing an answer is worse than showing a prompt.
 `TestBuzzAnswerIsPostedBackIntoTheChannel` is the guard, and it pushes the prompt
 back as a user message first — a fake that only emits assistant parts cannot see
 this bug at all.
+
+A part is also published *before* it holds any text, and the current generation
+repeats it in full as it grows rather than sending deltas: `properties.delta` is
+absent, so every `message.part.updated` for a part carries the whole accumulated
+`text`. Two rules follow, and both fail silently. An empty snapshot must not mark
+the part seen — it used to, so the one blank event at the start of a part swallowed
+every snapshot after it, the turn completed with nothing accumulated, and
+`buzzJob`'s empty `post` returned nil without publishing or logging: a mention
+answered by nothing. And a repeated snapshot must contribute only its new tail,
+which is why `seen` is `map[string]int` and not a set — the value is how much of
+that part has been emitted. A part that does arrive as deltas instead records
+`stream:<id>`, so its final full-text snapshot is not repeated on top of them.
+`TestAnEmptyPartDoesNotConsumeTheAnswer` and `TestAGrowingPartEmitsOnlyItsNewText`
+are the guards. `buzzJob` warns when a turn ends with nothing to post, which is the
+one line that turns this whole class of silence into a log entry.
 
 Other numbers that are deliberate, not arbitrary: `maxEventBytes` 32 MB per SSE
 line (an oversized line is dropped, the stream survives), `callTimeout` 30 s on

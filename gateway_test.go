@@ -556,7 +556,7 @@ func TestLoadRegistry(t *testing.T) {
 }
 
 func TestReduceEvent(t *testing.T) {
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	tests := []struct {
 		name  string
 		ev    map[string]any
@@ -610,13 +610,31 @@ func TestReduceEvent(t *testing.T) {
 			want: []reduced{{Type: TypeError, Payload: Payload{Error: "429", Text: "429"}}},
 		},
 		{
-			name: "idle via session.status",
-			ev:   map[string]any{"type": "session.status", "properties": map[string]any{"sessionID": "s", "status": "idle"}},
+			// The wire shape, captured from a real opencode 1.18.33 turn: status
+			// is an object. As a typed string it failed the unmarshal of the whole
+			// properties object, so reduceEvent dropped the event before the
+			// switch and this completion signal never fired.
+			name: "idle via session.status object",
+			ev:   map[string]any{"type": "session.status", "properties": map[string]any{"sessionID": "s", "status": map[string]any{"type": "idle"}}},
 			want: []reduced{{Type: TypeCompleted}},
 		},
 		{
 			name: "busy status is not completion",
-			ev:   map[string]any{"type": "session.status", "properties": map[string]any{"sessionID": "s", "status": "busy"}},
+			ev:   map[string]any{"type": "session.status", "properties": map[string]any{"sessionID": "s", "status": map[string]any{"type": "busy"}}},
+			want: nil,
+		},
+		{
+			// Older builds send the bare string, so both shapes have to work.
+			name: "idle via session.status string",
+			ev:   map[string]any{"type": "session.status", "properties": map[string]any{"sessionID": "s", "status": "idle"}},
+			want: []reduced{{Type: TypeCompleted}},
+		},
+		{
+			// OpenCode publishes a text part before it holds any text. Recording
+			// it as seen there dropped every later snapshot of the same part, so
+			// the turn completed with nothing accumulated and no reply was posted.
+			name: "empty first snapshot is silent",
+			ev:   map[string]any{"type": "message.part.updated", "properties": map[string]any{"part": map[string]any{"id": "p8", "type": "text", "text": ""}}},
 			want: nil,
 		},
 		{
@@ -656,6 +674,82 @@ func TestReduceEvent(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A text part arrives empty and fills in over the next few events. The
+// regression: marking an empty snapshot as seen dropped every later snapshot of
+// that part, so the turn reached completion with nothing accumulated and the
+// Buzz channel never got a reply — a whole answer lost to one blank event.
+func TestAnEmptyPartDoesNotConsumeTheAnswer(t *testing.T) {
+	seen := map[string]int{}
+	event := func(text string) opencodeEvent {
+		raw, _ := json.Marshal(map[string]any{"type": "message.part.updated", "properties": map[string]any{
+			"sessionID": "s",
+			"part":      map[string]any{"id": "p1", "type": "text", "messageID": "m1", "text": text},
+		}})
+		var oe opencodeEvent
+		_ = json.Unmarshal(raw, &oe)
+		return oe
+	}
+	if got := reduceEvent(event(""), seen); len(got) != 0 {
+		t.Fatalf("an empty part produced %+v, want nothing", got)
+	}
+	got := reduceEvent(event("the answer"), seen)
+	if len(got) != 1 || got[0].Type != TypeMessage || got[0].Payload.Text != "the answer" {
+		t.Fatalf("the text after an empty snapshot was lost: got %+v", got)
+	}
+}
+
+// OpenCode repeats a part in full as it grows, so the reducer emits only the
+// new tail of each snapshot. The regression: a bool dedupe set kept the first
+// snapshot and dropped the rest, so the channel got the answer's opening tokens
+// and then silence.
+func TestAGrowingPartEmitsOnlyItsNewText(t *testing.T) {
+	seen := map[string]int{}
+	event := func(text string, delta string) opencodeEvent {
+		raw, _ := json.Marshal(map[string]any{"type": "message.part.updated", "properties": map[string]any{
+			"sessionID": "s",
+			"delta":     delta,
+			"part":      map[string]any{"id": "p1", "type": "text", "messageID": "m1", "text": text},
+		}})
+		var oe opencodeEvent
+		_ = json.Unmarshal(raw, &oe)
+		return oe
+	}
+	var joined string
+	for _, snapshot := range []string{"The", "The answer", "The answer is 42."} {
+		for _, r := range reduceEvent(event(snapshot, ""), seen) {
+			joined += r.Payload.Text
+		}
+	}
+	if joined != "The answer is 42." {
+		t.Fatalf("snapshots assembled to %q", joined)
+	}
+	// A repeated snapshot is not new text.
+	if got := reduceEvent(event("The answer is 42.", ""), seen); len(got) != 0 {
+		t.Fatalf("a repeated snapshot produced %+v, want nothing", got)
+	}
+	// Deltas and snapshots are two shapes of the same stream: after deltas, a
+	// final full-text snapshot must not repeat what the deltas already sent.
+	seen = map[string]int{}
+	joined = ""
+	for _, d := range []string{"one ", "two ", "three"} {
+		for _, r := range reduceEvent(event("one two three", d), seen) {
+			joined += r.Payload.Text
+		}
+	}
+	joined += strings.Join(texts(reduceEvent(event("one two three", ""), seen)), "")
+	if joined != "one two three" {
+		t.Fatalf("a streamed part assembled to %q", joined)
+	}
+}
+
+func texts(rs []reduced) []string {
+	out := make([]string, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, r.Payload.Text)
+	}
+	return out
 }
 
 // Two simultaneous first messages must share one session. The regression: a
@@ -837,7 +931,7 @@ func TestOversizedRequestBodyRejected(t *testing.T) {
 // A part that streamed deltas must not also emit the final full-text snapshot:
 // the client would see the whole message twice.
 func TestDeltaThenSnapshotDoesNotDouble(t *testing.T) {
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	first := opencodeEvent{Type: "message.part.updated", Properties: json.RawMessage(
 		`{"delta":"Hel","part":{"id":"p1","type":"text","text":"Hello"}}`)}
 	second := opencodeEvent{Type: "message.part.updated", Properties: json.RawMessage(
@@ -868,6 +962,7 @@ func TestBuzzJobCompletesATurnThatNeverAccumulated(t *testing.T) {
 	agent := &Agent{Name: "frontend-agent", PubKey: strings.Repeat("ab", 32), sk: nostr.GeneratePrivateKey(), ck: map[string][32]byte{}}
 	// A pool with no relays: signing still runs, publishing resolves immediately.
 	nt := &nostrTransport{
+		log:       slog.New(slog.DiscardHandler),
 		turns:     map[string]*strings.Builder{},
 		buzzPools: map[string]*nostr.SimplePool{agent.Name: nostr.NewSimplePool(context.Background())},
 	}

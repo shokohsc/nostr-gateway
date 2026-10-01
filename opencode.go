@@ -50,12 +50,29 @@ type eventProps struct {
 	Info *message `json:"info"`
 	// Permission ids were called permissionID with a `response` value, and are
 	// now requestID with a `reply` value. Both spellings are in the wild.
-	PermissionID string          `json:"permissionID"`
-	RequestID    string          `json:"requestID"`
-	Response     string          `json:"response"`
-	Reply        string          `json:"reply"`
-	Status       string          `json:"status"`
-	Error        json.RawMessage `json:"error"`
+	PermissionID string `json:"permissionID"`
+	RequestID    string `json:"requestID"`
+	Response     string `json:"response"`
+	Reply        string `json:"reply"`
+	// Status is an object on every current OpenCode — {"type":"idle"} — and a
+	// bare string on older ones. It has to stay raw: a typed string fails the
+	// unmarshal of the *whole* eventProps, and reduceEvent drops an event it
+	// cannot parse without logging, so the completion signal every current build
+	// sends was being thrown away.
+	Status json.RawMessage `json:"status"`
+	Error  json.RawMessage `json:"error"`
+}
+
+// statusName reads the status out of either shape: a bare string, or the object
+// with a type field that current OpenCode sends.
+func statusName(raw json.RawMessage) string {
+	var obj struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return obj.Type
+	}
+	return strings.Trim(string(raw), `"`)
 }
 
 // message is UserMessage | AssistantMessage, discriminated on role.

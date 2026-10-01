@@ -30,12 +30,14 @@ func sessionOf(ev opencodeEvent) string {
 
 // reduceEvent collapses OpenCode's event stream onto the agent protocol. `seen`
 // is the conversation's dedupe set, and it is also where the reducer remembers
-// which messages are the human's — see the message.updated case.
+// which messages are the human's — see the message.updated case. A value of 0
+// means unseen; for a text part the value is how much of it has been emitted
+// already, so a growing snapshot can be diffed against what went out.
 //
 // ponytail: `seen` is in-memory, so a gateway restart could replay one event
 // from a relay. Harmless (duplicates are dropped downstream by event id); move
 // it to a shared store only if dedupe across restarts is ever required.
-func reduceEvent(ev opencodeEvent, seen map[string]bool) []reduced {
+func reduceEvent(ev opencodeEvent, seen map[string]int) []reduced {
 	var p eventProps
 	if err := json.Unmarshal(ev.Properties, &p); err != nil {
 		return nil
@@ -57,7 +59,7 @@ func reduceEvent(ev opencodeEvent, seen map[string]bool) []reduced {
 		// started mid-turn — and the part is then treated as the agent's, which is
 		// how it behaved before: losing an answer is worse than showing a prompt.
 		if p.Info != nil && p.Info.Role == "user" && p.Info.ID != "" {
-			seen[userKey(p.Info.ID)] = true
+			seen[userKey(p.Info.ID)] = 1
 		}
 		return nil
 
@@ -73,7 +75,7 @@ func reduceEvent(ev opencodeEvent, seen map[string]bool) []reduced {
 	case "session.status":
 		// Newer OpenCode builds report completion through a status event; only
 		// the idle status means the turn is over.
-		if strings.EqualFold(p.Status, "idle") {
+		if strings.EqualFold(statusName(p.Status), "idle") {
 			return []reduced{{Type: TypeCompleted}}
 		}
 		return nil
@@ -90,10 +92,10 @@ func reduceEvent(ev opencodeEvent, seen map[string]bool) []reduced {
 			return nil
 		}
 		key := "perm:" + id
-		if seen[key] {
+		if seen[key] != 0 {
 			return nil
 		}
-		seen[key] = true
+		seen[key] = 1
 		return []reduced{{Type: TypePermissionReq, Payload: Payload{PermissionID: id, Title: p.Title, Text: p.Title}}}
 
 	case "permission.replied":
@@ -107,11 +109,11 @@ func reduceEvent(ev opencodeEvent, seen map[string]bool) []reduced {
 	}
 }
 
-func reducePart(pt part, delta string, seen map[string]bool) []reduced {
+func reducePart(pt part, delta string, seen map[string]int) []reduced {
 	// The human's own text, streamed back by OpenCode. Nothing downstream wants
 	// it: a Buzz answer is one message with the agent's words in it, and a
 	// subscriber already has the prompt.
-	if pt.MessageID != "" && seen[userKey(pt.MessageID)] {
+	if pt.MessageID != "" && seen[userKey(pt.MessageID)] != 0 {
 		return nil
 	}
 	switch pt.Type {
@@ -124,17 +126,31 @@ func reducePart(pt part, delta string, seen map[string]bool) []reduced {
 		if text != "" {
 			// Remember that this part streams, so a final full-text snapshot of
 			// the same part is not emitted on top of its own deltas.
-			seen["stream:"+pt.ID] = true
+			seen["stream:"+pt.ID] = 1
 		} else {
-			key := pt.Type + ":" + pt.ID
-			if seen[key] || seen["stream:"+pt.ID] {
-				return nil
-			}
-			seen[key] = true
 			text = pt.Text
 		}
 		if strings.TrimSpace(text) == "" {
+			// Nothing to emit and nothing to remember. OpenCode publishes a part
+			// before it has any text, and marking it seen here drops every
+			// snapshot of it that follows — the whole answer with it, so the turn
+			// completes with nothing accumulated and the channel gets no reply.
 			return nil
+		}
+		if delta == "" {
+			if seen["stream:"+pt.ID] != 0 {
+				return nil // already emitted as deltas; do not repeat the whole thing
+			}
+			// A snapshot, not a delta: OpenCode repeats the whole part as it
+			// grows, so emit only what is new. Keeping just the first snapshot
+			// posts the answer's opening tokens and nothing after them.
+			key := pt.Type + ":" + pt.ID
+			n := seen[key]
+			if len(text) <= n {
+				return nil
+			}
+			text = text[n:]
+			seen[key] = n + len(text)
 		}
 		return []reduced{{Type: typ, Payload: Payload{Text: text}}}
 
@@ -145,10 +161,10 @@ func reducePart(pt part, delta string, seen map[string]bool) []reduced {
 			return nil // running and completed are the ones worth a progress event
 		}
 		key := "tool:" + pt.CallID + ":" + status
-		if seen[key] {
+		if seen[key] != 0 {
 			return nil
 		}
-		seen[key] = true
+		seen[key] = 1
 		if status == "running" {
 			return []reduced{{Type: TypeToolStarted, Payload: Payload{Tool: pt.Tool, CallID: pt.CallID, Title: pt.State.Title}}}
 		}
