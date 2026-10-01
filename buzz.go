@@ -33,6 +33,10 @@ const (
 	// apart from a person. Replaceable (10000-19999), so one event per author
 	// is enough.
 	buzzProfileKind = 10100
+	// buzzPresenceKind is Buzz's presence update: the content is the status
+	// string, and the relay keys the result on the pubkey the connection
+	// authenticated as. WebSocket only — the relay rejects it over HTTP.
+	buzzPresenceKind = 20001
 	// buzzConvPrefix marks a conversation that is a Buzz channel, so the answer
 	// goes back into the channel instead of out as a kind-30078 envelope.
 	buzzConvPrefix = "buzz-"
@@ -171,6 +175,29 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 		// channel UI, so the operator cannot even add it to one. Gating this
 		// on a non-empty result is a bootstrap deadlock.
 		n.buzzProfile(ctx, a)
+
+		// Keep the UI's presence state in sync while we are listening: publish
+		// a kind 20001 presence update every refresh interval, re-using the
+		// same agent-authenticated connection pool.
+		if pool != nil {
+			ev := nostr.Event{
+				Kind:      buzzPresenceKind,
+				CreatedAt: nostr.Now(),
+				Content:   "online",
+				Tags:      nostr.Tags{{"status", "online"}},
+			}
+			if err := ev.Sign(a.sk); err == nil {
+				// Fire and forget — a failed presence publish must not tear
+				// down the subscription.
+				go func(relays []string, ev nostr.Event) {
+					for res := range pool.PublishMany(context.WithoutCancel(ctx), relays, ev) {
+						if res.Error != nil {
+							return
+						}
+					}
+				}(n.buzzRelays, ev)
+			}
+		}
 
 		ids := make([]string, 0, len(chans))
 		for id := range chans {

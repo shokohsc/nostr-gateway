@@ -60,14 +60,32 @@ OpenCode session once, atomically) → `opencodeClient.promptAsync` → SSE from
 (SSE) + the Nostr publish queue.
 
 `buzz.go` is a transport like `nostr.go`, and it is the one place that both reads
-and writes Buzz. It publishes two things and no more: the NIP-OA agent profile
-(kind `10100`), once per agent, so Buzz knows the pubkey is an agent, and the
-agent's answers, as kind `9` in the channel the mention came from. The profile
-must stay signed by the agent's own key, kind `10100` must not grow any channel
-traffic in its content, and `buzzProfile` must keep firing on a member list that
-names no channel — Buzz's channel UI is how an agent gets added to a channel, so
-an agent that waits to be a member to be registered is an agent that can never
-join.
+and writes Buzz. It publishes three things and no more: the NIP-OA agent profile
+(kind `10100`), once per agent, so Buzz knows the pubkey is an agent; presence
+(kind `20001`), on every refresh tick, so Buzz's UI shows the agent online; and
+the agent's answers, as kind `9` in the channel the mention came from. The
+profile must stay signed by the agent's own key, kind `10100` must not grow any
+channel traffic in its content, and `buzzProfile` must keep firing on a member
+list that names no channel — Buzz's channel UI is how an agent gets added to a
+channel, so an agent that waits to be a member to be registered is an agent that
+can never join.
+
+Presence is a **heartbeat, not a one-off**: the relay stores it with a 180s TTL
+(`PRESENCE_TTL_SECS`, `buzz-pubsub/src/presence.rs`) against a documented 60s
+heartbeat interval, so publishing once on connect goes stale within three
+minutes. It rides the `buzzRefresh` tick, which is already 60s. Two traps worth
+keeping: the relay keys presence on the pubkey the connection **authenticated**
+as (`auth_pubkey`, `handlers/event.rs:944`), not the event's author, so it only
+lands on an authenticated connection; and it rejects kind `20001` over HTTP
+(`ingest.rs:2313`), so it must go out on the WebSocket pool. It is fire-and-
+forget on its own goroutine — a failed presence publish must not tear down the
+subscription. Tests assert it with `hasPublished`, not `publishKinds`, because
+it interleaves with channel traffic unpredictably.
+
+Do not expect presence to fix deafness. Nothing in the delivery path reads it:
+`filter_fanout_by_access`, `push_match` and `authorized_requested_channels` ask
+about community, visibility and membership only, and the sole non-test reader of
+presence is `api/bridge.rs:2598`, which decorates HTTP query results for the UI.
 Inbound is unchanged — a mention becomes a prompt through `hub.Handle`, so
 `allow`, the lock order and one-session-per-conversation all still hold.
 

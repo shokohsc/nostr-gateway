@@ -311,6 +311,23 @@ func (r *fakeRelay) publishKinds() []int {
 	return slices.Clone(r.published)
 }
 
+// channelPublishKinds is publishKinds without the presence heartbeat. Presence
+// (kind 20001) goes out on its own goroutine on every refresh, so it interleaves
+// with the profile and the answers unpredictably and a test that asserts on the
+// order of channel traffic must not see it.
+func (r *fakeRelay) channelPublishKinds() []int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.DeleteFunc(slices.Clone(r.published), func(k int) bool { return k == buzzPresenceKind })
+}
+
+// hasPublished reports whether the gateway pushed an event of this kind here.
+func (r *fakeRelay) hasPublished(kind int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Contains(r.published, kind)
+}
+
 // postsOf returns the events of one kind the gateway pushed here, whole.
 func (r *fakeRelay) postsOf(kind int) []*nostr.Event {
 	r.mu.Lock()
@@ -904,8 +921,14 @@ func TestBuzzMentionsAndDMsReachOpenCode(t *testing.T) {
 	// Nothing but the profile crosses to the Buzz relay when the agent has said
 	// nothing yet, and no envelope crosses the other way either: a channel
 	// conversation answers into the channel, not as a kind-30078.
-	if kinds := buzz.publishKinds(); !slices.Equal(kinds, []int{buzzProfileKind}) {
+	if kinds := buzz.channelPublishKinds(); !slices.Equal(kinds, []int{buzzProfileKind}) {
 		t.Fatalf("published %v to the buzz relay, want just [%d]", kinds, buzzProfileKind)
+	}
+	// Presence, so Buzz's UI shows the agent as online rather than offline. It
+	// is a heartbeat, not a one-off: the relay keys presence with a 180s TTL
+	// against a 60s heartbeat interval, so one event on connect goes stale.
+	if !buzz.hasPublished(buzzPresenceKind) {
+		t.Fatal("no presence published, so Buzz shows the agent offline")
 	}
 	if kinds := relay.publishKinds(); len(kinds) != 0 {
 		t.Fatalf("published %v for a buzz conversation, want nothing", kinds)
@@ -995,7 +1018,7 @@ func TestBuzzAnswerIsPostedBackIntoTheChannel(t *testing.T) {
 	if kinds := relay.publishKinds(); len(kinds) != 0 {
 		t.Fatalf("published %v to the message relays, want nothing", kinds)
 	}
-	if kinds := buzz.publishKinds(); !slices.Equal(kinds, []int{buzzProfileKind, buzzChatKind}) {
+	if kinds := buzz.channelPublishKinds(); !slices.Equal(kinds, []int{buzzProfileKind, buzzChatKind}) {
 		t.Fatalf("published %v to the buzz relay, want the profile then the answer", kinds)
 	}
 }
@@ -1114,7 +1137,7 @@ func TestBuzzDiscoverySurvivesALostNIP42Handshake(t *testing.T) {
 	if h.convs.get(buzzConversation(group)) == nil {
 		t.Fatal("the channel the agent is in has no conversation")
 	}
-	if kinds := buzz.publishKinds(); !slices.Equal(kinds, []int{buzzProfileKind}) {
+	if kinds := buzz.channelPublishKinds(); !slices.Equal(kinds, []int{buzzProfileKind}) {
 		t.Fatalf("published %v to the buzz relay, want just [%d]", kinds, buzzProfileKind)
 	}
 }
@@ -1208,7 +1231,7 @@ func TestBuzzProfileIsPublishedWhenNoRosterNamesTheAgent(t *testing.T) {
 	go nt.run(ctx)
 
 	waitFor(t, "the agent profile before any channel exists", func() bool {
-		return slices.Equal(relay.publishKinds(), []int{buzzProfileKind})
+		return slices.Equal(relay.channelPublishKinds(), []int{buzzProfileKind})
 	})
 }
 

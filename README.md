@@ -205,8 +205,8 @@ export BUZZ_RELAYS='ws://buzz.example.internal:3000'
 - The agent's `npub` has to be a member of the Buzz relay
   (`buzz-admin add-member`) or the subscription is closed, same as above.
 
-**What is published to the Buzz relays**: the agent's answers, and one other kind
-of event. An answer to a channel message is a kind `9` in that same channel,
+**What is published to the Buzz relays**: the agent's answers, plus two other
+kinds of event. An answer to a channel message is a kind `9` in that same channel,
 signed by the agent's own key, with an `h` tag for the channel and a `p` tag for
 the person who asked — a chat client renders nothing else there. A channel message
 is one message per turn however many deltas the turn streamed, so the answer is
@@ -223,6 +223,11 @@ published once, as soon as the relay has served a member list — that is what
 proves the connection passed NIP-42. It does not wait for the agent to be in a
 channel: Buzz's channel UI is how an agent gets added to one, so an agent
 waiting to be a member to be registered is an agent that can never join.
+
+The third kind is presence (kind `20001`), the heartbeat that makes Buzz show the
+agent as online. It is republished once a minute because the relay expires a
+presence entry after three. Presence is display only — it has no effect on
+whether the agent receives channel messages.
 
 
 **Inbound otherwise.** A permission
