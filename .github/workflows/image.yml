@@ -1,0 +1,44 @@
+name: image
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # GitHub has no short-sha expression, so cut the tag in the shell.
+      - name: tag
+        id: tag
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      # GHCR needs no registry secret: GITHUB_TOKEN with `packages: write`.
+      - name: login to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # ponytail: one platform, no build cache — the module is a single pure-Go
+      # package, so a cold build is about a minute. Move to docker/build-push-action
+      # with a docker-container builder and --cache-from type=gha (and --platform)
+      # when that stops being true.
+      - name: build and push
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          image="${IMAGE,,}" # GHCR paths are lowercase
+          docker build \
+            --tag "$image:${{ steps.tag.outputs.short }}" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            .
+          docker push "$image:${{ steps.tag.outputs.short }}"
