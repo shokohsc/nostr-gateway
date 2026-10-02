@@ -353,6 +353,13 @@ func (n *nostrTransport) buzzProfile(ctx context.Context, a *Agent) {
 // allow list is checked before anything else, and the mention is the p tag, not
 // the @name in the text.
 func (n *nostrTransport) buzzReceive(ctx context.Context, a *Agent, ev *nostr.Event, chans buzzChannels) {
+	// The same window as the encrypted listener, and for the same reason: this
+	// subscription is reopened on every buzzRefresh and a relay hands a new
+	// subscription everything it still stores, so a mention is re-delivered
+	// every minute unless something remembers that it was already answered.
+	if !n.seen.fresh(a, ev.ID) {
+		return
+	}
 	// Our own channel replies come back on our own subscription: a relay fans an
 	// event out to the connection that published it too, and go-nostr does not
 	// filter self-authored events. In a two-member channel every message counts

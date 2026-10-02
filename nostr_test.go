@@ -1369,3 +1369,77 @@ func TestOneRelayListServesBothRoles(t *testing.T) {
 		t.Fatal("no presence, so Buzz shows the agent offline")
 	}
 }
+
+// One relay event, one prompt. A relay is free to deliver the same event more
+// than once: it hands a new subscription everything it still stores, and this
+// gateway re-opens both of its subscriptions — the encrypted one on every drop,
+// the channel one every buzzRefresh. Handling the second copy is not a second
+// message, it is a second prompt into a conversation that is already running:
+// two OpenCode sessions' worth of work, one answer the human sees and one that
+// arrives from nowhere.
+//
+// Driven through receive/buzzReceive rather than through a subscription, because
+// that is where the id is checked and the second copy has to die. go-nostr
+// already drops a repeat inside one live subscription; the copies that matter
+// arrive on the next one.
+func TestOneRelayEventIsOnePrompt(t *testing.T) {
+	f := newFakeOC(t)
+	relay := newFakeRelay(t)
+	relay.requireAuth = true
+	relay.store = true
+
+	usk := nostr.GeneratePrivateKey()
+	ask := nostr.GeneratePrivateKey()
+	apk, _ := nostr.GetPublicKey(ask)
+	agent := &Agent{Name: "frontend-agent", OpenCode: f.URL, PubKey: apk, sk: ask, ck: map[string][32]byte{}}
+	reg := &Registry{byName: map[string]*Agent{agent.Name: agent}}
+
+	channel := "channel-dedupe"
+	ck, err := nip44.GenerateConversationKey(apk, usk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(Envelope{
+		V: protocolVersion, Conversation: "nostr-1", Agent: "frontend-agent",
+		Type: TypeMessage, Payload: Payload{Text: "only once"},
+	})
+	cipher, err := nip44.Encrypt(string(body), ck)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := nostr.Event{
+		Kind: messageKind, CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{{"p", apk}}, Content: cipher,
+	}
+	if err := envelope.Sign(usk); err != nil {
+		t.Fatal(err)
+	}
+	mention := buzzMessage(t, usk, "h", channel, apk, "@frontend-agent only once")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	h.nostr = nt
+	go h.run(ctx)
+
+	// Each event twice, as a relay replays one: same id, same bytes, the
+	// second copy arriving after the first was already answered.
+	for range 2 {
+		if err := nt.receive(ctx, agent, &envelope); err != nil {
+			t.Fatalf("envelope: %v", err)
+		}
+		nt.buzzReceive(ctx, agent, mention, buzzChannels{channel: 3})
+	}
+	waitFor(t, "both messages delivered", func() bool {
+		_, p, _ := f.counts()
+		return p == 2
+	})
+	// Two prompts is the answer, and it has to stay two: a third is the
+	// duplicate getting through.
+	time.Sleep(300 * time.Millisecond)
+	if _, p, _ := f.counts(); p != 2 {
+		t.Fatalf("%d prompts for two events, want one each", p)
+	}
+}
