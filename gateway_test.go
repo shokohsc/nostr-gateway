@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -999,5 +1000,28 @@ func TestBuzzJobCompletesATurnThatNeverAccumulated(t *testing.T) {
 	}
 	if len(nt.turns) != 0 {
 		t.Fatalf("in-flight turns left behind: %v", nt.turns)
+	}
+}
+
+// One list, three variables. RELAYS is the name; the two old names still work,
+// their entries merge in, and a relay named in two of them is one relay — the
+// same websocket twice is the NIP-42 collision buzzPools exists to avoid.
+// Nothing set at all falls back to the public defaults rather than to nothing.
+func TestRelayListMergesTheDeprecatedVariables(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+	t.Setenv("RELAYS", "wss://one.example, wss://two.example")
+	t.Setenv("NOSTR_RELAYS", "wss://two.example")
+	t.Setenv("BUZZ_RELAYS", "wss://three.example")
+	got := relayList(log)
+	want := []string{"wss://one.example", "wss://two.example", "wss://three.example"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("relay list %v, want %v", got, want)
+	}
+
+	t.Setenv("RELAYS", "")
+	t.Setenv("NOSTR_RELAYS", "")
+	t.Setenv("BUZZ_RELAYS", "")
+	if got := relayList(log); !slices.Equal(got, splitCSV(defaultRelays)) {
+		t.Fatalf("unset relays gave %v, want the defaults %v", got, splitCSV(defaultRelays))
 	}
 }

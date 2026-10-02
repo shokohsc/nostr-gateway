@@ -45,18 +45,16 @@ data:
         "opencode_agent": "build"
       }
     }
-  relays: "wss://nos.lol,wss://relay.damus.io"
-  # Buzz/NIP-29 relays, deliberately separate from `relays`. A relay may be
-  # named in both: the gateway then opens a second, agent-authenticated
-  # connection for Buzz, so the channel listener and the member-list discovery
-  # never answer a NIP-42 challenge on the same websocket.
+  # Every relay the gateway talks to, and it fills both roles on all of them:
+  # the encrypted kind-30078 envelopes in and out, plus the Buzz channels, the
+  # agent profile and presence. A relay that serves no NIP-29 answers the channel
+  # discovery with nothing, which is one `warn` line and a `debug` line per
+  # refresh, so a plain public relay in this list is fine.
   #
-  # Empty is the documented off state, and it is off *silently* — with no Buzz
-  # pool the gateway subscribes to no channel at all, and an answer to a mention
-  # is published as a kind-30078 envelope instead, which a Buzz client does not
-  # render. That is the agent answering a message nobody can see. Wire this up to
-  # actually use channels.
-  buzz_relays: ""
+  # The split that matters is per connection, not per relay: each agent opens one
+  # pool for the encrypted listener and another for the channel events, so their
+  # NIP-42 handshakes cannot collide on one websocket.
+  relays: "wss://nos.lol,wss://relay.damus.io"
 ---
 # The agent itself. Fields follow plan.md §10; check them against the
 # KubeOpenCode CRD version you actually run.
@@ -138,16 +136,11 @@ spec:
           env:
             - name: AGENTS_FILE
               value: /etc/gateway/agents.json
-            - name: NOSTR_RELAYS
+            - name: RELAYS
               valueFrom:
                 configMapKeyRef:
                   name: gateway-config
                   key: relays
-            - name: BUZZ_RELAYS
-              valueFrom:
-                configMapKeyRef:
-                  name: gateway-config
-                  key: buzz_relays
             - name: GATEWAY_ADDR
               value: ":8080"
             # Debug, not the default info, because the lines that tell a dead

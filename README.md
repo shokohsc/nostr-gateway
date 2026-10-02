@@ -136,12 +136,29 @@ the same.
 | --- | --- | --- |
 | `AGENTS_FILE` | — | Path to the agent registry (required) |
 | `AGENTS` | — | Same JSON inline, used when `AGENTS_FILE` is unset |
-| `NOSTR_RELAYS` | `wss://nos.lol,wss://relay.damus.io` | Comma-separated relay URLs |
-| `BUZZ_RELAYS` | unset | Comma-separated Buzz relay URLs. Set it and each agent joins the Buzz channels it is a member of, answers mentions in the channel, and publishes its agent profile. A relay may be named in both this and `NOSTR_RELAYS`: Buzz gets its own connection either way |
+| `RELAYS` | `wss://nos.lol,wss://relay.damus.io` | Comma-separated relay URLs. Every relay fills both roles: it carries the encrypted kind-`30078` envelopes in and out, and the Buzz channels, the agent profile and presence — so a Buzz relay is one you put here |
+| `NOSTR_RELAYS` | — | **Deprecated**, merged into `RELAYS`. Still read, warned about, and never the only way to say it |
+| `BUZZ_RELAYS` | — | **Deprecated**, merged into `RELAYS`. Same |
 | `GATEWAY_ADDR` | `:8080` | HTTP listen address |
 | `GATEWAY_TOKEN` | unset | Bearer token for the HTTP API. **Unset means the HTTP API is open to anything that can reach it**, so the gateway logs a warning at startup. An empty `allow` list has the same consequence on the Nostr path |
 | `OPENCODE_USER` / `OPENCODE_PASSWORD` | unset | Basic auth for OpenCode servers that require it |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+
+### One relay list
+
+There is no "Nostr relay" and "Buzz relay" here, so there is one variable.
+Every relay in `RELAYS` is asked for encrypted envelopes *and* for Buzz
+channels, and gets the agent profile and presence as well; a relay that does
+not serve NIP-29 simply answers the channel discovery with nothing, which is
+logged once at `warn` and then at `debug` on every refresh. The split that does
+matter is per connection, not per relay: each agent opens one pool for the
+encrypted listener and another for the channel events, because two
+subscriptions answering a NIP-42 challenge on one websocket collide.
+
+`NOSTR_RELAYS` and `BUZZ_RELAYS` are still read and merged into the same list,
+so an old ConfigMap keeps working, but each entry of theirs is still one relay:
+a relay named in two of the three variables is opened once per role, not twice
+per role.
 
 ### Relays that require NIP-42
 
@@ -154,7 +171,7 @@ subscription is closed with `auth-required: verification failed`.
 
 Each agent holds its own pool and therefore its own connection, because a
 closed relay accepts only events signed by the key that authenticated that
-connection. A relay in `BUZZ_RELAYS` gets a second, separate pool per agent, so
+connection. Every relay in `RELAYS` gets a second, separate pool per agent, so
 the Buzz handshake never collides with the kind-30078 one on a shared
 connection — see `AGENTS.md` for what that collision costs.
 
@@ -163,11 +180,12 @@ connection — see `AGENTS.md` for what that collision costs.
 [Buzz](https://github.com/block/buzz) is a Nostr workspace that speaks NIP-29, so
 its chats are not kind `30078` envelopes: a message is a kind `9` event tagged
 `#h <channel-uuid>`, an @mention is that message with a `p` tag for the agent's
-`npub`, and a DM is just a channel the agent shares with one other person. Set
-`BUZZ_RELAYS` and the gateway joins in:
+`npub`, and a DM is just a channel the agent shares with one other person. Every
+relay in `RELAYS` is asked for channels, so a Buzz relay is one you put in that
+list:
 
 ```bash
-export BUZZ_RELAYS='ws://buzz.example.internal:3000'
+export RELAYS='wss://nos.lol,ws://buzz.example.internal:3000'
 ```
 
 - A relay only hands channel-scoped events to a subscription that names the
@@ -205,15 +223,14 @@ export BUZZ_RELAYS='ws://buzz.example.internal:3000'
 - The agent's `npub` has to be a member of the Buzz relay
   (`buzz-admin add-member`) or the subscription is closed, same as above.
 
-**What is published to the Buzz relays**: the agent's answers, plus two other
+**What is published to the relays**: the agent's answers, plus two other
 kinds of event. An answer to a channel message is a kind `9` in that same channel,
 signed by the agent's own key, with an `h` tag for the channel and a `p` tag for
 the person who asked — a chat client renders nothing else there. A channel message
 is one message per turn however many deltas the turn streamed, so the answer is
 assembled and posted when the turn ends. Nothing else is: the tool calls, the
 reasoning and the acks stay off the channel, and a conversation that is not a
-Buzz channel still answers with an encrypted kind-`30078` envelope on
-`NOSTR_RELAYS`.
+Buzz channel still answers with an encrypted kind-`30078` envelope on `RELAYS`.
 
 The second kind is the NIP-OA agent profile (kind `10100`), which is what Buzz
 reads to know which pubkeys are agents, and
@@ -399,9 +416,9 @@ Nostr replies, registry
 loading and key normalisation from env, a Buzz mention and a Buzz DM reaching
 OpenCode (and group chatter not reaching it) with one session per channel, a
 streamed answer assembled into one kind-9 channel message with nothing published
-to `NOSTR_RELAYS`, the agent not answering its own channel replies, a Buzz
+to `RELAYS`, the agent not answering its own channel replies, a Buzz
 discovery recovering from a refused NIP-42 handshake, a Buzz discovery on a relay
-that is also a `NOSTR_RELAYS` entry, the agent profile published before the agent
+that is also a `RELAYS` entry, the agent profile published before the agent
 is in any channel, a Buzz turn that reaches `completed` with nothing accumulated
 without taking the process down, and a full Nostr round trip
 (NIP-44, kind, `p` tag routing, encrypted reply) against an in-process fake relay,
