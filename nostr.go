@@ -26,18 +26,17 @@ const messageKind = 30078
 type nostrTransport struct {
 	pools  map[string]*nostr.SimplePool
 	relays []string
-	// buzzRelays carry Buzz channel traffic in both directions, plus the agent
-	// profile; see buzz.go.
-	buzzRelays []string
-	// buzzPools are the same agents' pools for buzzRelays, one connection
-	// each. They are separate from pools because a relay named in both lists
-	// would otherwise put the kind-30078 listener and the Buzz discovery on one
-	// websocket, where their NIP-42 handshakes collide: go-nostr keys its OK
-	// waiters by event id (relay.go:371), two handshakes built in the same
-	// second are byte-identical, the second Store overwrites the first, and the
-	// loser waits out its whole context instead of returning. The Buzz
-	// discovery holds a 15s deadline, so it stalled for all of it, came back
-	// empty with the member list right there, and the agent heard nothing.
+	// buzzPools are the same agents' pools for the channel events — kind 9, the
+	// member-list discovery, the agent profile and presence — one connection each
+	// over the same relay list. They are separate from pools not because those
+	// relays are a different kind of relay (there is no such kind here, see
+	// relayList) but because two subscriptions answering a NIP-42 challenge on one
+	// websocket collide: go-nostr keys its OK waiters by event id
+	// (relay.go:371), two handshakes built in the same second are byte-identical,
+	// the second Store overwrites the first, and the loser waits out its whole
+	// context instead of returning. The Buzz discovery holds a 15s deadline, so it
+	// stalled for all of it, came back empty with the member list right there, and
+	// the agent heard nothing.
 	buzzPools map[string]*nostr.SimplePool
 	// turns holds the answer in flight per Buzz conversation, so a turn becomes
 	// one channel message instead of one per streaming delta. Owned by the
@@ -46,10 +45,14 @@ type nostrTransport struct {
 	// profiled remembers which agents have published their Buzz agent profile.
 	// One writer per key — that agent's buzzListen goroutine.
 	profiled map[string]bool
-	reg      *Registry
-	hub      *hub
-	log      *slog.Logger
-	out      chan job
+	// warned remembers which (agent, fault) pairs have already been logged at
+	// Warn, so a state that repeats every minute is said once loudly and then at
+	// debug. Same one-writer-per-key rule as profiled.
+	warned map[string]bool
+	reg    *Registry
+	hub    *hub
+	log    *slog.Logger
+	out    chan job
 }
 
 // job is one outbound envelope. buzz is the channel uuid when the conversation
@@ -67,21 +70,22 @@ type job struct {
 // by a different key, so a shared pool would have the agents fight over the one
 // authenticated identity — the losers go deaf with no error anywhere.
 //
-// And one pool per role, for the same reason one layer down: a relay in both
-// NOSTR_RELAYS and BUZZ_RELAYS gets a second pool, so the message listener and
-// the Buzz discovery never answer a challenge on the same connection.
-func newNostrTransport(ctx context.Context, relays, buzzRelays []string, reg *Registry, h *hub, log *slog.Logger) *nostrTransport {
+// And two pools per agent, for the same reason one layer down: the encrypted
+// listener and the channel listener never share a websocket, so their NIP-42
+// handshakes cannot collide (see buzzPools). Both are opened against every relay
+// in relays — one list, both roles, no relay type.
+func newNostrTransport(ctx context.Context, relays []string, reg *Registry, h *hub, log *slog.Logger) *nostrTransport {
 	n := &nostrTransport{
-		pools:      map[string]*nostr.SimplePool{},
-		relays:     relays,
-		buzzRelays: buzzRelays,
-		buzzPools:  map[string]*nostr.SimplePool{},
-		turns:      map[string]*strings.Builder{},
-		profiled:   map[string]bool{},
-		reg:        reg,
-		hub:        h,
-		log:        log,
-		out:        make(chan job, 256),
+		pools:     map[string]*nostr.SimplePool{},
+		relays:    relays,
+		buzzPools: map[string]*nostr.SimplePool{},
+		turns:     map[string]*strings.Builder{},
+		profiled:  map[string]bool{},
+		warned:    map[string]bool{},
+		reg:       reg,
+		hub:       h,
+		log:       log,
+		out:       make(chan job, 256),
 	}
 	for _, name := range reg.names() {
 		a := reg.byName[name]
@@ -90,9 +94,7 @@ func newNostrTransport(ctx context.Context, relays, buzzRelays []string, reg *Re
 			continue
 		}
 		n.pools[name] = newAgentPool(ctx, a, log)
-		if len(buzzRelays) > 0 {
-			n.buzzPools[name] = newAgentPool(ctx, a, log)
-		}
+		n.buzzPools[name] = newAgentPool(ctx, a, log)
 	}
 	return n
 }
@@ -120,13 +122,11 @@ func (n *nostrTransport) run(ctx context.Context) {
 		if n.pools[name] != nil {
 			a := n.reg.byName[name]
 			go n.listen(ctx, a)
-			if n.buzzPools[name] != nil {
-				// Its own pool, so the Buzz connection authenticates as the
-				// agent's own key on a connection of its own, which is what a
-				// closed Buzz relay checks and what keeps its handshake from
-				// colliding with the listener's.
-				go n.buzzListen(ctx, a)
-			}
+			// Its own pool, so the channel connection authenticates as the
+			// agent's own key on a connection of its own, which is what a closed
+			// relay checks and what keeps its handshake from colliding with the
+			// listener's.
+			go n.buzzListen(ctx, a)
 		}
 	}
 	<-ctx.Done()
@@ -266,11 +266,6 @@ func (n *nostrTransport) send(a *Agent, peer string, env Envelope) error {
 		return fmt.Errorf("agent %s has no private key", a.Name)
 	}
 	buzz, _ := buzzChannelOf(env.Conversation)
-	if buzz != "" && n.buzzPools[a.Name] == nil {
-		// A channel conversation with no Buzz pool (BUZZ_RELAYS unset) still has
-		// to reach the person who wrote in it, so fall back to the envelope.
-		buzz = ""
-	}
 	select {
 	case n.out <- job{agent: a, peer: peer, buzz: buzz, env: env}:
 		return nil
@@ -289,7 +284,7 @@ func (n *nostrTransport) reply(a *Agent, peer string, env Envelope) {
 	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
 	defer cancel()
 	var err error
-	if channel, ok := buzzChannelOf(env.Conversation); ok && n.buzzPools[a.Name] != nil {
+	if channel, ok := buzzChannelOf(env.Conversation); ok {
 		err = n.buzzPost(ctx, a, channel, peer, env.Payload.Text)
 	} else {
 		err = n.publish(ctx, a, peer, env)
@@ -330,14 +325,57 @@ func (n *nostrTransport) publish(ctx context.Context, a *Agent, peer string, env
 	if err := ev.Sign(a.sk); err != nil {
 		return err
 	}
+	return n.publishTo(ctx, pool, ev)
+}
 
+// publishTo sends one event to every relay on one pool.
+//
+// A refusal from one relay is not a failure of the publish. Every relay in the
+// list now serves both roles, so a channel answer goes to relays that have never
+// heard of that channel and to public ones that hold no membership of this agent,
+// and a refusal from those says nothing about the reader having seen the answer
+// — it only says this relay is not the one that hosts it. Each refusal is
+// therefore logged at debug with the relay that made it, and the caller only ever
+// hears about a publish that every relay in the list refused, which is the case
+// worth a Warn. A pool with no relays to ask publishes nothing and is not a
+// failure: relayList never hands one out (it falls back to the defaults), and
+// buzzProfile is retried on the next discovery.
+func (n *nostrTransport) publishTo(ctx context.Context, pool *nostr.SimplePool, ev nostr.Event) error {
 	var firstErr error
+	taken := false
 	for res := range pool.PublishMany(ctx, n.relays, ev) {
-		if res.Error != nil && firstErr == nil {
+		if res.Error == nil {
+			taken = true
+			continue
+		}
+		if firstErr == nil {
 			firstErr = res.Error
 		}
+		n.log.Debug("relay refused an event", "kind", ev.Kind, "relay", res.RelayURL, "err", res.Error)
+	}
+	if taken || firstErr == nil {
+		return nil
 	}
 	return firstErr
+}
+
+// warnOnce says a fault at Warn the first time an agent runs into it and at debug
+// after that. The Buzz listener wakes every buzzRefresh — a minute — and finds
+// the same state waiting for it, so a relay list that serves no NIP-29 at all
+// (which any list of public relays now does) used to put a Warn per agent per
+// minute on top of each other. The first line says what is wrong and what to do
+// about it; the repeats are the same line again, and they bury the next fault.
+// The first time is the whole point of a Warn, so a state that clears and comes
+// back later still only gets said once.
+func (n *nostrTransport) warnOnce(a *Agent, fault, msg string, args ...any) {
+	key := a.Name + "|" + fault
+	args = append([]any{"agent", a.Name}, args...)
+	if n.warned[key] {
+		n.log.Debug(msg, args...)
+		return
+	}
+	n.warned[key] = true
+	n.log.Warn(msg, args...)
 }
 
 // tagValue is Tags.Find + Tag.Value, which go-nostr has deprecated in favour of

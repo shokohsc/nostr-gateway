@@ -95,8 +95,15 @@ func buzzChannelTag(tags nostr.Tags) string {
 // buzzChannelOf is the inverse: the channel a conversation belongs to, or false
 // for a conversation that is not a Buzz channel at all.
 func buzzChannelOf(conv string) (string, bool) {
-	channel, ok := strings.CutPrefix(conv, buzzConvPrefix)
-	return channel, ok && channel != ""
+	if channel, ok := strings.CutPrefix(conv, buzzConvPrefix); ok && channel != "" {
+		return channel, true
+	}
+	// CutPrefix hands back the whole conversation when the prefix is missing, so
+	// an ordinary `nostr-` conversation came out of here named after itself: the
+	// first return is the channel, and a caller that reads only that one routed
+	// every kind-30078 answer into buzzJob, where a conversation with no turn in
+	// flight posts nothing at all.
+	return "", false
 }
 
 // buzzDiscover lists the channels the agent is in. NIP-29 publishes one member
@@ -117,7 +124,7 @@ func (n *nostrTransport) buzzDiscover(ctx context.Context, a *Agent) (buzzChanne
 	defer cancel()
 	chans, rosters := buzzChannels{}, 0
 	filter := nostr.Filter{Kinds: []int{buzzMemberKind}, Tags: nostr.TagMap{"p": []string{a.PubKey}}}
-	for ie := range n.buzzPools[a.Name].FetchMany(ctx, n.buzzRelays, filter) {
+	for ie := range n.buzzPools[a.Name].FetchMany(ctx, n.relays, filter) {
 		if ie.Event == nil {
 			continue // EOSE, or a subscription the relay closed
 		}
@@ -148,7 +155,8 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 		if rosters == 0 {
 			// A relay that returns no member lists at all has not really
 			// answered — see buzzRetryDelay. Ask again before believing it.
-			n.log.Warn("buzz: discovery came back with no member lists", "agent", a.Name, "relays", n.buzzRelays)
+			n.warnOnce(a, "no-member-lists", "buzz: discovery came back with no member lists",
+				"relays", n.relays)
 			if !wait(ctx, buzzRetryDelay) {
 				return
 			}
@@ -160,8 +168,8 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 			// who may fetch it, so this is the case where the relay is not
 			// serving the member lists — not the case where the agent is in no
 			// channel. Say so, and keep looking.
-			n.log.Warn("buzz: relay serves no member lists for this agent", "agent", a.Name,
-				"relays", n.buzzRelays, "pubkey", a.PubKey[:8],
+			n.warnOnce(a, "no-member-lists-again", "buzz: relay serves no member lists for this agent",
+				"relays", n.relays, "pubkey", a.PubKey[:8],
 				"hint", "NIP-29 kind 39002 is optional and a relay may restrict who may fetch it: check the relay serves it to this pubkey, and that the pubkey is a relay member (buzz-admin add-member)")
 			if !wait(ctx, buzzRefresh) {
 				return
@@ -179,24 +187,18 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 		// Keep the UI's presence state in sync while we are listening: publish
 		// a kind 20001 presence update every refresh interval, re-using the
 		// same agent-authenticated connection pool.
-		if pool != nil {
-			ev := nostr.Event{
-				Kind:      buzzPresenceKind,
-				CreatedAt: nostr.Now(),
-				Content:   "online",
-				Tags:      nostr.Tags{{"status", "online"}},
-			}
-			if err := ev.Sign(a.sk); err == nil {
-				// Fire and forget — a failed presence publish must not tear
-				// down the subscription.
-				go func(relays []string, ev nostr.Event) {
-					for res := range pool.PublishMany(context.WithoutCancel(ctx), relays, ev) {
-						if res.Error != nil {
-							return
-						}
-					}
-				}(n.buzzRelays, ev)
-			}
+		ev := nostr.Event{
+			Kind:      buzzPresenceKind,
+			CreatedAt: nostr.Now(),
+			Content:   "online",
+			Tags:      nostr.Tags{{"status", "online"}},
+		}
+		if err := ev.Sign(a.sk); err == nil {
+			// Fire and forget on its own goroutine — a failed presence publish
+			// must not tear down the subscription. Presence now goes to every
+			// relay, and the ones that are not Buzz simply refuse it, which
+			// publishTo says at debug.
+			go n.publishTo(context.WithoutCancel(ctx), pool, ev)
 		}
 
 		ids := make([]string, 0, len(chans))
@@ -208,7 +210,7 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 			// A real answer: the relay has member lists and none of them name
 			// this pubkey. A wait for a join, not a failed connection, so it
 			// does not back off.
-			n.log.Warn("buzz: agent is in no channel yet", "agent", a.Name,
+			n.warnOnce(a, "no-channel", "buzz: agent is in no channel yet",
 				"rosters", rosters,
 				"hint", "the relay's kind-39002 member lists do not name this pubkey: add it to a channel, then reconcile the rosters")
 			if !wait(ctx, buzzRefresh) {
@@ -262,7 +264,7 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 		// own publish log, that is the difference between a message the relay
 		// never delivered and one the gateway refused (which buzzReceive logs).
 		n.log.Debug("buzz: asked for channel messages", "agent", a.Name,
-			"channels", len(ids), "allow_list", len(a.Allow) > 0, "relays", n.buzzRelays)
+			"channels", len(ids), "allow_list", len(a.Allow) > 0, "relays", n.relays)
 		// The subscription gets its own context so a refresh can end it on the
 		// wire: go-nostr turns a cancelled context into a NIP-01 CLOSE, and
 		// leaving the old REQ open would keep the relay fanning out to a stale
@@ -271,7 +273,7 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 		ended := make(chan struct{})
 		go func() {
 			defer close(ended)
-			for ie := range pool.SubscribeMany(subCtx, n.buzzRelays, filter) {
+			for ie := range pool.SubscribeMany(subCtx, n.relays, filter) {
 				if ie.Event == nil {
 					continue // EOSE
 				}
@@ -336,14 +338,10 @@ func (n *nostrTransport) buzzProfile(ctx context.Context, a *Agent) {
 		n.log.Warn("buzz: agent profile not signed", "agent", a.Name, "err", err)
 		return
 	}
-	var firstErr error
-	for res := range n.buzzPools[a.Name].PublishMany(ctx, n.buzzRelays, ev) {
-		if res.Error != nil && firstErr == nil {
-			firstErr = res.Error
-		}
-	}
-	if firstErr != nil {
-		n.log.Warn("buzz: agent profile not published, retrying with the next discovery", "agent", a.Name, "err", firstErr)
+	// Published to every relay and refused by the ones that are not Buzz, which
+	// is no longer a failure worth a warning: see publishTo.
+	if err := n.publishTo(ctx, n.buzzPools[a.Name], ev); err != nil {
+		n.log.Warn("buzz: agent profile not published, retrying with the next discovery", "agent", a.Name, "err", err)
 		return
 	}
 	n.profiled[a.Name] = true
@@ -499,6 +497,10 @@ func (n *nostrTransport) buzzJob(ctx context.Context, j job) error {
 // key — the agent is a member of the channel, which is how it discovered it, and
 // a closed relay accepts nothing else. The p tag names the person who asked, so
 // a group client renders the answer as addressed to them.
+//
+// It goes to every relay, because there is no longer a Buzz relay list to be on:
+// the channel lives on one of them and the rest refuse, which publishTo reports
+// at debug.
 func (n *nostrTransport) buzzPost(ctx context.Context, a *Agent, channel, peer, text string) error {
 	pool, ok := n.buzzPools[a.Name]
 	if !ok {
@@ -512,13 +514,7 @@ func (n *nostrTransport) buzzPost(ctx context.Context, a *Agent, channel, peer, 
 	if err := ev.Sign(a.sk); err != nil {
 		return err
 	}
-	var firstErr error
-	for res := range pool.PublishMany(ctx, n.buzzRelays, ev) {
-		if res.Error != nil && firstErr == nil {
-			firstErr = res.Error
-		}
-	}
-	return firstErr
+	return n.publishTo(ctx, pool, ev)
 }
 
 // wait sleeps for d and reports whether the wait finished rather than the

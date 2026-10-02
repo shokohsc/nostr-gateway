@@ -355,9 +355,14 @@ func (r *fakeRelay) dial() *relayConn {
 		panic(err)
 	}
 	c := &relayConn{ws: ws, ctx: context.Background()}
-	r.mu.Lock()
-	r.conns[c] = struct{}{}
-	r.mu.Unlock()
+	// Not registered, unlike a client of a real relay: the httptest handler
+	// behind this websocket has already put the *server* end of this same
+	// socket in conns, so broadcast delivers to the test client through it.
+	// Registering this end too wrote every event twice on one socket — once out
+	// to the client, once back into the relay, which then read its own echo as
+	// a publish and fanned it out again. Fifty thousand copies of one event
+	// before the first assertion, and a socket too flooded for the client to
+	// read its answer.
 	return c
 }
 
@@ -395,7 +400,7 @@ func TestNostrRoundTrip(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, nil, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -479,7 +484,7 @@ func TestNostrPermissionReply(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, nil, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -542,7 +547,7 @@ func TestNostrAllowList(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, nil, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -582,7 +587,7 @@ func TestHTTPCannotRedirectNostrReplies(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, nil, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -638,7 +643,7 @@ func TestNostrRoutesByPTag(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, nil, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -680,14 +685,17 @@ func TestNostrAuthenticatesPerAgentOnAClosedRelay(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, nil, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
 
-	// One challenge answered per agent, and both subscriptions through.
+	// One challenge answered per agent, and both subscriptions through. Each
+	// agent has two pools over one relay list, so there are two connections per
+	// agent to authenticate and to subscribe on — the split is what keeps their
+	// NIP-42 handshakes from colliding on one websocket.
 	waitFor(t, "every agent authenticated", func() bool {
-		return relay.authCount() == 2 && relay.subscribeCount() == 2
+		return relay.authCount() >= 4 && relay.subscribeCount() >= 4
 	})
 
 	usk := nostr.GeneratePrivateKey()
@@ -745,7 +753,7 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -886,7 +894,7 @@ func TestBuzzMentionsAndDMsReachOpenCode(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, []string{buzz.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url(), buzz.url()}, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -930,8 +938,12 @@ func TestBuzzMentionsAndDMsReachOpenCode(t *testing.T) {
 	if !buzz.hasPublished(buzzPresenceKind) {
 		t.Fatal("no presence published, so Buzz shows the agent offline")
 	}
-	if kinds := relay.publishKinds(); len(kinds) != 0 {
-		t.Fatalf("published %v for a buzz conversation, want nothing", kinds)
+	// Not nothing this time: one relay list means the message relay is also the
+	// channel relay, so the profile and presence reach it too. What must not
+	// cross is the envelope — a channel conversation answers into the channel,
+	// never as a kind-30078.
+	if kinds := relay.channelPublishKinds(); slices.Contains(kinds, messageKind) {
+		t.Fatalf("published %v for a buzz conversation, want no envelope", kinds)
 	}
 }
 
@@ -962,7 +974,7 @@ func TestBuzzAnswerIsPostedBackIntoTheChannel(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, []string{buzz.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url(), buzz.url()}, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -1015,8 +1027,10 @@ func TestBuzzAnswerIsPostedBackIntoTheChannel(t *testing.T) {
 	}
 	// A kind-30078 envelope for the same conversation would be the old, invisible
 	// answer, and it would also land in the same relay as a read-state event.
-	if kinds := relay.publishKinds(); len(kinds) != 0 {
-		t.Fatalf("published %v to the message relays, want nothing", kinds)
+	// One relay list means this relay also gets the channel answer as a kind 9
+	// and the profile and presence on top; only the envelope is wrong here.
+	if kinds := relay.publishKinds(); slices.Contains(kinds, messageKind) {
+		t.Fatalf("published %v to the message relays, want no envelope", kinds)
 	}
 	if kinds := buzz.channelPublishKinds(); !slices.Equal(kinds, []int{buzzProfileKind, buzzChatKind}) {
 		t.Fatalf("published %v to the buzz relay, want the profile then the answer", kinds)
@@ -1037,7 +1051,7 @@ func TestBuzzIgnoresItsOwnChannelReplies(t *testing.T) {
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(context.Background(), nil, nil, reg, h, log)
+	nt := newNostrTransport(context.Background(), nil, reg, h, log)
 
 	// The agent's own kind-9, in a two-member channel, addressed to the agent.
 	own := buzzMessage(t, ask, "h", "channel-dm", apk, "the agent's own answer")
@@ -1070,7 +1084,7 @@ func TestBuzzRefusalsNameTheFault(t *testing.T) {
 
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	nt := newNostrTransport(context.Background(), nil, nil, reg, newHub(reg, log), log)
+	nt := newNostrTransport(context.Background(), nil, reg, newHub(reg, log), log)
 	chans := buzzChannels{"channel-dm": 2, "channel-group": 5}
 
 	nt.buzzReceive(context.Background(), agent,
@@ -1126,7 +1140,7 @@ func TestBuzzDiscoverySurvivesALostNIP42Handshake(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, []string{buzz.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url(), buzz.url()}, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -1172,7 +1186,7 @@ func TestBuzzDiscoveryOnARelaySharedWithTheMessageListener(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -1225,7 +1239,7 @@ func TestBuzzProfileIsPublishedWhenNoRosterNamesTheAgent(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -1267,4 +1281,91 @@ func buzzMessage(t *testing.T, sk, tag, channel, mention, text string) *nostr.Ev
 		t.Fatal(err)
 	}
 	return ev
+}
+
+// One list, one relay, both roles, both directions. This is what the two
+// relay variables could not say: nothing here marks a relay as the encrypted
+// kind or the channel kind, so a single relay has to carry both listeners,
+// both kinds of answer, and the profile and presence that used to need a
+// BUZZ_RELAYS of their own.
+func TestOneRelayListServesBothRoles(t *testing.T) {
+	f := newFakeOC(t)
+	relay := newFakeRelay(t)
+	relay.requireAuth = true
+	relay.store = true
+
+	usk := nostr.GeneratePrivateKey()
+	upk, _ := nostr.GetPublicKey(usk)
+	ask := nostr.GeneratePrivateKey()
+	apk, _ := nostr.GetPublicKey(ask)
+	agent := &Agent{Name: "frontend-agent", OpenCode: f.URL, PubKey: apk, sk: ask, ck: map[string][32]byte{}}
+	reg := &Registry{byName: map[string]*Agent{agent.Name: agent}}
+
+	// The agent is in a channel, so the channel listener has a name to ask for.
+	channel := "channel-one-relay"
+	relay.inject(buzzMembers(t, usk, apk, channel, 3))
+	relay.inject(buzzMessage(t, usk, "h", channel, apk, "@frontend-agent and you?"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	h.nostr = nt
+	go h.run(ctx)
+	go nt.run(ctx)
+
+	waitFor(t, "the channel mention", func() bool { _, p, _ := f.counts(); return p == 1 })
+
+	// The turn, answered as a kind 9 in the channel it came from and addressed
+	// to the person who asked.
+	f.push("message.part.updated", map[string]any{
+		"sessionID": "ses_1", "delta": "on it",
+		"part": map[string]any{"id": "prt_1", "type": "text", "sessionID": "ses_1", "messageID": "msg_asst"},
+	})
+	f.push("session.idle", map[string]any{"sessionID": "ses_1"})
+	waitFor(t, "the channel answer", func() bool { return len(relay.postsOf(buzzChatKind)) == 1 })
+	post := relay.postsOf(buzzChatKind)[0]
+	if got := tagValue(post.Tags, "h"); got != channel {
+		t.Fatalf("h tag %q, want channel %q", got, channel)
+	}
+	if !post.Tags.ContainsAny("p", []string{upk}) {
+		t.Fatalf("no p tag for the person who asked: %v", post.Tags)
+	}
+
+	// And the encrypted side, on the same relay: an inbound envelope becomes a
+	// prompt, and its answer goes back out as a kind-30078 envelope.
+	ck, err := nip44.GenerateConversationKey(apk, usk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(Envelope{
+		V: protocolVersion, Conversation: "nostr-1", Agent: "frontend-agent",
+		Type: TypeMessage, Payload: Payload{Text: "hello over nostr"},
+	})
+	cipher, err := nip44.Encrypt(string(body), ck)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := nostr.Event{
+		Kind: messageKind, CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{{"p", apk}}, Content: cipher,
+	}
+	if err := in.Sign(usk); err != nil {
+		t.Fatal(err)
+	}
+	relay.inject(&in)
+	waitFor(t, "the encrypted message", func() bool {
+		_, p, _ := f.counts()
+		return p == 2
+	})
+	waitFor(t, "the envelope answer", func() bool { return relay.hasPublished(messageKind) })
+
+	// Plus the two events a Buzz relay used to be needed for at all.
+	if !relay.hasPublished(buzzProfileKind) {
+		t.Fatal("no agent profile, so the pubkey does not show up in Buzz as an agent")
+	}
+	if !relay.hasPublished(buzzPresenceKind) {
+		t.Fatal("no presence, so Buzz shows the agent offline")
+	}
 }

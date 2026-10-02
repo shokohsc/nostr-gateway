@@ -35,14 +35,27 @@ The same version builds *identical* NIP-42 auth events when two subscriptions
 answer a challenge in the same second, and it keys the `OK` waiters by event id
 (`relay.go:371`), so the second `Store` overwrites the first and the loser of the
 pair waits out its context instead of returning. This is why each agent has its
-own pool **per role**: the `buzzPools` entry is a second, separate pool for
-`BUZZ_RELAYS`, so the kind-30078 listener and the Buzz discovery never answer a
-challenge on one connection. Sharing one is what made the gateway deaf — with a
-relay in both lists (the normal production setup, since the kind-30078 answers
-have to land somewhere the agent is a member) the discovery lost the race, sat
-out its whole 15s `buzzFetchTimeout`, returned empty with the member list right
-there, and the agent subscribed to no channel at all.
-`TestBuzzDiscoveryOnARelaySharedWithTheMessageListener` is the guard.
+own pool **per role**: `buzzPools` is a second, separate pool over the *same*
+relay list, so the kind-30078 listener and the Buzz discovery never answer a
+challenge on one connection. Sharing one is what made the gateway deaf — on a
+relay that fills both roles (every relay, since `RELAYS` is one list) the
+discovery lost the race, sat out its whole 15s `buzzFetchTimeout`, returned
+empty with the member list right there, and the agent subscribed to no channel
+at all. `TestBuzzDiscoveryOnARelaySharedWithTheMessageListener` and
+`TestOneRelayListServesBothRoles` are the guards: the second one is what keeps a
+change from shrinking the list back to "the Buzz relay" without a test noticing.
+
+The pools are per role, the relay list is not per role. `relayList` in `main.go`
+is the only place that reads relay configuration; `NOSTR_RELAYS` and
+`BUZZ_RELAYS` survive there as deprecated aliases because an old ConfigMap that
+still sets only those two would otherwise be read as "nothing set" and fall back
+to the public defaults — an agent on a private Buzz relay going deaf with a
+clean log. Everything downstream takes `nostrTransport.relays`: Buzz profile,
+presence and channel posts all go to the same relays as the envelopes, and a
+relay refusing one of them is logged at `debug` with the relay that refused and
+is only a failure when no relay took it. `warnOnce` exists for the faults that
+repeat on the `buzzRefresh` tick: said once at `warn`, then `debug` per repeat,
+keyed by agent and fault.
 
 ## Wiring
 
@@ -90,7 +103,15 @@ Inbound is unchanged — a mention becomes a prompt through `hub.Handle`, so
 `allow`, the lock order and one-session-per-conversation all still hold.
 
 The route out is the conversation id, not the hub: `buzzConvPrefix` marks a
-conversation as a channel, and `nostr.send` branches on it. `hub` stays
+conversation as a channel, and `nostr.send` branches on it. `buzzChannelOf` is
+the only reader of that prefix, and it returns `("", false)` for anything else —
+do not let a caller take just its first return. `strings.CutPrefix` hands back
+the *whole* conversation when the prefix is missing, so a `nostr-` conversation
+once came out of `buzzChannelOf` named after itself, and every kind-30078 answer
+was routed into `buzzJob`, where a conversation with no turn in flight posts
+nothing at all. The symptom is silence: no error, no event, no answer. The old
+`send` guard (`buzzPools[a] == nil`) hid it, because a nil buzz pool made the
+leaked value get thrown away; with one relay list the pool always exists. `hub` stays
 transport-blind, so **if a second transport ever needs its own outbound path it
 gets its own conversation-id prefix, not a field on the hub.** A kind-30078
 envelope is what a Nostr subscriber renders, and Buzz renders kind 9, so the
@@ -303,5 +324,14 @@ backpressure.
   `next`/`want` on the subscription channel; async conditions use `waitFor`.
   The fake relay deliberately ignores subscription filters, so filter behaviour
   has to be tested by what the gateway does or does not process.
+- The fake relay's `dial` — the client end a test opens to stand in for a
+  user's other device — must not register itself in `conns`. The `httptest`
+  handler behind that same websocket has already put the *server* end there, so
+  registering both ends writes every broadcast twice on one socket: once out to
+  the test client, once back into the relay, which reads its own echo as a
+  publish and fans it out again. Fifty thousand copies of one event before the
+  first assertion, and a socket too flooded for the client to read its answer.
+  The symptom was `TestNostrRoundTrip` failing on the reply and passing on the
+  baseline.
 - The fake relay is intentionally not closed at test cleanup; the comment there
   explains why. Leave it.

@@ -26,12 +26,10 @@ func main() {
 	h := newHub(reg, log)
 
 	token := os.Getenv("GATEWAY_TOKEN")
-	relays := splitCSV(envOr("NOSTR_RELAYS", defaultRelays))
-	log.Info("nostr relays", "relays", strings.Join(relays, ","))
-	nt := newNostrTransport(ctx, relays, splitCSV(os.Getenv("BUZZ_RELAYS")), reg, h, log)
-	if len(nt.buzzRelays) > 0 {
-		log.Info("buzz relays (channels read, channel answers written, agent profile published)", "relays", strings.Join(nt.buzzRelays, ","))
-	}
+	relays := relayList(log)
+	log.Info("relays", "relays", strings.Join(relays, ","),
+		"roles", "encrypted kind-30078 envelopes in and out, Buzz channels read and answered, agent profile and presence published")
+	nt := newNostrTransport(ctx, relays, reg, h, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -51,6 +49,38 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// relayList is every relay the gateway talks to, as one list, because there is
+// no such thing here as a nostr relay and a Buzz relay: the gateway runs both
+// roles on every relay it is given, and a relay that answers NIP-29 differs from
+// one that does not only in what comes back.
+//
+// RELAYS is the name. NOSTR_RELAYS and BUZZ_RELAYS are still read and their
+// entries merged in, because a ConfigMap still carrying only those two would
+// otherwise be read as "none set" and fall back to the public defaults — an agent
+// on a private Buzz relay going deaf with a clean log. Deprecated, warned about,
+// and never the only way to say it.
+func relayList(log *slog.Logger) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, env := range []string{"RELAYS", "NOSTR_RELAYS", "BUZZ_RELAYS"} {
+		if env != "RELAYS" && os.Getenv(env) != "" {
+			log.Warn("relay variable is deprecated: every relay goes in RELAYS now, both roles included",
+				"var", env)
+		}
+		for _, r := range splitCSV(os.Getenv(env)) {
+			if seen[r] { // the same relay in two of the three variables is still one relay
+				continue
+			}
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	if len(out) == 0 {
+		return splitCSV(defaultRelays)
+	}
+	return out
 }
 
 func splitCSV(s string) []string {
