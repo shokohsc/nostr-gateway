@@ -238,6 +238,21 @@ that swallows its result makes the agent deaf with nothing in the log.
   or a `permission_request` posted on its own and took the turn with it, and
   `*strings.Builder.String()` dereferences its own fields. `TestBuzzJobCompletesATurnThatNeverAccumulated`
   is the guard.
+- `seen` is the dedupe window: one entry per relay event id per agent, dropped in
+  `receive` and `buzzReceive` before anything else, because a repeat costs a
+  second prompt into a live conversation and a frame the relay already spent. The
+  id is the relay's, not the envelope's — it is a hash of the signed event, so it
+  is the one thing two deliveries of the same message cannot disagree about.
+  One writer per agent, and there are exactly two per agent (the two listeners
+  are separate connections on purpose), so this map is not behind a lock and must
+  not grow one without noticing that. It is per process: two replicas sharing an
+  agent each hold their own window, which is fine only because exactly one of
+  them subscribes — the leader election in `deploy/k8s.yaml` is what makes that
+  true, so a second subscriber is a bug even though every id check would still
+  pass. go-nostr already drops repeats inside one live subscription, so the
+  copies that matter are the ones that arrive on the next one: every reconnect
+  and, on the channel side, every `buzzRefresh`, where a relay replays everything
+  it still stores.
 - Every relay call on a listener's own goroutine carries `callTimeout`. A
   `context.Background()` publish to a relay that never answers stalls that
   agent's entire inbound stream — the listener is the only reader.

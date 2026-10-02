@@ -351,6 +351,15 @@ republishes under its own protocol.
   one request per id. There is no rate limit and no cap either.
 - The Nostr subscription only looks 5 seconds back, so a gateway restart misses
   messages sent while it was down. Same for a Buzz channel subscription.
+- A relay may deliver one event more than once, and this gateway re-opens both of
+  its subscriptions — the encrypted one on every dropped connection, the channel
+  one every refresh. Relays hand a new subscription everything they still store,
+  so a stored event is re-delivered on the next one, and a live conversation
+  would be prompted a second time. The last 512 relay event ids per agent are
+  remembered in memory and repeats are dropped before they reach OpenCode, which
+  is per pod and per process: two replicas sharing an agent each keep their own
+  window, so the duplicate suppression that spans replicas is leader election
+  (`deploy/k8s.yaml`), not this map.
 - `allow` is not a relay-side filter, and neither is a channel or kind
   narrowing, so the relay streams every event in the subscribed kinds to the
   gateway and the gateway discards the ones it does not want. A busy channel with
@@ -420,6 +429,8 @@ to `RELAYS`, the agent not answering its own channel replies, a Buzz
 discovery recovering from a refused NIP-42 handshake, a Buzz discovery on a relay
 that is also a `RELAYS` entry, the agent profile published before the agent
 is in any channel, a Buzz turn that reaches `completed` with nothing accumulated
-without taking the process down, and a full Nostr round trip
+without taking the process down, and one relay carrying both roles in both
+directions, one relay event delivered twice reaching OpenCode once, a full Nostr
+round trip
 (NIP-44, kind, `p` tag routing, encrypted reply) against an in-process fake relay,
 including a relay that demands NIP-42 and authenticates each agent separately.

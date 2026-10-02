@@ -17,6 +17,47 @@ import (
 // range of NIP-31 is meant for exactly this).
 const messageKind = 30078
 
+// dedupeWindow is how many recent relay event ids per agent are remembered as
+// already handled. One window of ids is the whole mechanism; nothing is
+// persisted and nothing is shared between pods.
+const dedupeWindow = 512
+
+// seen is one relay event id per agent, most recent last. A relay does not
+// promise to deliver an event once: it re-sends what it stored when a
+// subscription reopens, several pods behind one Service each get their own copy
+// of the same event, and a fan-out on a connection that dropped mid-write ends
+// in a retry. Handling one twice is not a duplicate message, it is a second
+// prompt into the same conversation — two sessions' worth of work, one answer
+// the human sees and a second one that arrives as a stranger.
+//
+// The key is the relay's own event id, not the envelope id: the event id is a
+// hash of the signed event, so it is the one thing two deliveries of the same
+// message cannot disagree about.
+type seenEvents map[string][]string
+
+// fresh reports whether this agent has not handled this relay event yet, and
+// records it if not. One writer per agent (that agent's listener goroutine),
+// except the channel listener, which is its own goroutine for the same agent —
+// see the pool split for why those are separate connections, and note that this
+// map is therefore shared between exactly those two.
+func (s seenEvents) fresh(a *Agent, id string) bool {
+	window := s[a.Name]
+	for _, seen := range window {
+		if seen == id {
+			return false
+		}
+	}
+	if len(window) >= dedupeWindow {
+		// ponytail: a ring of the last dedupeWindow ids per agent. A relay
+		// replaying more than that on reconnect is a cursor problem, not a
+		// dedupe one — see listen's Since — and the upgrade is that cursor, not
+		// a bigger ring.
+		window = window[len(window)-dedupeWindow+1:]
+	}
+	s[a.Name] = append(window, id)
+	return true
+}
+
 // nostrTransport carries the agent protocol over Nostr. Every envelope is
 // NIP-44 encrypted between the user's key and the agent's key, so relays and
 // observers see only ciphertext: kind, timestamps and tags.
@@ -42,6 +83,11 @@ type nostrTransport struct {
 	// one channel message instead of one per streaming delta. Owned by the
 	// publish worker goroutine, which is its only writer.
 	turns map[string]*strings.Builder
+	// seen is the per-agent window of relay event ids already handled, so one
+	// delivery of one message is one prompt however many copies of it arrive.
+	// Not a lock: one writer per agent — the listener goroutine and, for the
+	// channel listener, the buzzListen goroutine.
+	seen seenEvents
 	// profiled remembers which agents have published their Buzz agent profile.
 	// One writer per key — that agent's buzzListen goroutine.
 	profiled map[string]bool
@@ -80,6 +126,7 @@ func newNostrTransport(ctx context.Context, relays []string, reg *Registry, h *h
 		relays:    relays,
 		buzzPools: map[string]*nostr.SimplePool{},
 		turns:     map[string]*strings.Builder{},
+		seen:      seenEvents{},
 		profiled:  map[string]bool{},
 		warned:    map[string]bool{},
 		reg:       reg,
@@ -215,6 +262,13 @@ func (n *nostrTransport) listen(ctx context.Context, a *Agent) {
 // receive decrypts one relay event and hands the envelope to the hub. Handling
 // is synchronous so a conversation's messages stay in the order they arrived.
 func (n *nostrTransport) receive(ctx context.Context, a *Agent, ev *nostr.Event) error {
+	// A relay is free to deliver one event more than once: it re-sends what it
+	// stored to a subscription that reopens, and every drop of this listener
+	// reopens it. Checked before the allow list because a second prompt into a
+	// running conversation costs more than a second frame.
+	if !n.seen.fresh(a, ev.ID) {
+		return nil
+	}
 	// The allow list is checked before any key work, so a blocked sender costs
 	// nothing beyond the frame the relay already delivered.
 	if !a.allows(ev.PubKey) {
