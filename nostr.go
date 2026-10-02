@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -97,8 +98,12 @@ type nostrTransport struct {
 	warned map[string]bool
 	reg    *Registry
 	hub    *hub
-	log    *slog.Logger
-	out    chan job
+	// lead decides which replica of the gateway subscribes to the relays, and is
+	// nil when there is no lease to hold — one replica, or a binary run outside a
+	// cluster. It gates the listeners and nothing else: see listeners.
+	lead *election
+	log  *slog.Logger
+	out  chan job
 }
 
 // job is one outbound envelope. buzz is the channel uuid when the conversation
@@ -120,7 +125,7 @@ type job struct {
 // listener and the channel listener never share a websocket, so their NIP-42
 // handshakes cannot collide (see buzzPools). Both are opened against every relay
 // in relays — one list, both roles, no relay type.
-func newNostrTransport(ctx context.Context, relays []string, reg *Registry, h *hub, log *slog.Logger) *nostrTransport {
+func newNostrTransport(ctx context.Context, relays []string, reg *Registry, h *hub, lead *election, log *slog.Logger) *nostrTransport {
 	n := &nostrTransport{
 		pools:     map[string]*nostr.SimplePool{},
 		relays:    relays,
@@ -131,6 +136,7 @@ func newNostrTransport(ctx context.Context, relays []string, reg *Registry, h *h
 		warned:    map[string]bool{},
 		reg:       reg,
 		hub:       h,
+		lead:      lead,
 		log:       log,
 		out:       make(chan job, 256),
 	}
@@ -165,17 +171,7 @@ func newAgentPool(ctx context.Context, a *Agent, log *slog.Logger) *nostr.Simple
 
 func (n *nostrTransport) run(ctx context.Context) {
 	go n.worker(ctx)
-	for _, name := range n.reg.names() {
-		if n.pools[name] != nil {
-			a := n.reg.byName[name]
-			go n.listen(ctx, a)
-			// Its own pool, so the channel connection authenticates as the
-			// agent's own key on a connection of its own, which is what a closed
-			// relay checks and what keeps its handshake from colliding with the
-			// listener's.
-			go n.buzzListen(ctx, a)
-		}
-	}
+	go n.listeners(ctx)
 	<-ctx.Done()
 	for _, p := range n.pools {
 		p.Close("shutdown")
@@ -185,9 +181,57 @@ func (n *nostrTransport) run(ctx context.Context) {
 	}
 }
 
+// listeners subscribes every agent to the relays, for as long as this replica is
+// the one allowed to. It is the only gate there is, and it is enough because of
+// who can be inbound: an agent key is one identity, so a second subscriber turns
+// every message into a second prompt in a second OpenCode session, and the answer
+// goes out twice.
+//
+// The publish side needs no gate of its own. It follows from this one: the worker
+// only ever holds jobs for conversations that have a Nostr reply peer (hub.emit
+// skips Nostr without one, and only a relay event sets it), and only the
+// subscriber sees relay events — so a follower has nothing to publish, and an
+// HTTP caller, which has no Nostr peer at all, gets its answer in its own
+// response.
+func (n *nostrTransport) listeners(ctx context.Context) {
+	if n.lead == nil {
+		n.listenAll(ctx)
+		return
+	}
+	for ctx.Err() == nil {
+		n.lead.hold(ctx, n.listenAll)
+		n.log.Info("standing by for the relay lease")
+	}
+}
+
+// listenAll runs the listeners for one term and returns when every one of them
+// has. That wait is what makes a second term safe: the listeners exit on the term
+// context, so a new subscription started while the old ones are still draining
+// would be a second subscriber for the agent whose messages they have not
+// finished handling.
+func (n *nostrTransport) listenAll(ctx context.Context) {
+	var wg sync.WaitGroup
+	for _, name := range n.reg.names() {
+		if n.pools[name] == nil {
+			continue
+		}
+		a := n.reg.byName[name]
+		wg.Add(2)
+		// Its own pool, so the channel connection authenticates as the agent's
+		// own key on a connection of its own, which is what a closed relay checks
+		// and what keeps its handshake from colliding with the listener's.
+		go func() { defer wg.Done(); n.listen(ctx, a) }()
+		go func() { defer wg.Done(); n.buzzListen(ctx, a) }()
+	}
+	wg.Wait()
+}
+
 // worker publishes queued envelopes one at a time so relay traffic keeps the
 // order the agent produced it in. It is also the only writer of the in-flight
 // Buzz turns, so an answer is posted as one message the moment its turn ends.
+//
+// It runs on every replica, which is not a second publisher: see listeners for why
+// only the lease holder ever has work for it.
 func (n *nostrTransport) worker(ctx context.Context) {
 	for {
 		select {

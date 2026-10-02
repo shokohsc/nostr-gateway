@@ -140,6 +140,7 @@ the same.
 | `NOSTR_RELAYS` | — | **Deprecated**, merged into `RELAYS`. Still read, warned about, and never the only way to say it |
 | `BUZZ_RELAYS` | — | **Deprecated**, merged into `RELAYS`. Same |
 | `GATEWAY_ADDR` | `:8080` | HTTP listen address |
+| `LEASE_NAME` | — | Name of the `coordination.k8s.io` Lease that decides which replica subscribes to the relays. Unset means one replica, which is the default and needs no Kubernetes API access at all |
 | `GATEWAY_TOKEN` | unset | Bearer token for the HTTP API. **Unset means the HTTP API is open to anything that can reach it**, so the gateway logs a warning at startup. An empty `allow` list has the same consequence on the Nostr path |
 | `OPENCODE_USER` / `OPENCODE_PASSWORD` | unset | Basic auth for OpenCode servers that require it |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
@@ -313,6 +314,39 @@ export GATEWAY_TOKEN=$(openssl rand -hex 32)
 below does. `deploy/k8s.yaml` has the whole set: Secret, ConfigMap, KubeOpenCode
 `Agent`, cluster-internal Service for the agent, and a central gateway Deployment.
 
+### Running more than one replica
+
+Replicas share the agent configuration already — `AGENTS_FILE` is a ConfigMap and
+`nsec_env` a Secret, so every pod reads the same agents and the same keys — and
+only one of them may subscribe to the relays. An agent key is one identity: a
+second subscriber carrying a REQ for the same `p` tag turns every message into two
+prompts in two OpenCode sessions, and the answer goes out twice.
+
+`LEASE_NAME` is what lets the second pod exist. It names a
+`coordination.k8s.io` Lease, and the replica holding it is the one that subscribes
+and publishes:
+
+```bash
+export LEASE_NAME=nostr-gateway   # POD_NAME and POD_NAMESPACE come from the
+                                  # downward API; see deploy/k8s.yaml
+```
+
+- **Every replica serves the HTTP API in full**, lease holder or not. A chat
+  completion is prompted, waited for and answered inside its own request, so a
+  follower is not a degraded gateway — it is a complete gateway on the HTTP face
+  and idle on the relay face. The Service is what makes that face highly
+  available, and nothing else is needed for it.
+- The holder renews its claim every 5s against a 15s lease. A pod that is evicted
+  hands it back on the way out, so a rolling update does not wait the lease out; a
+  pod whose renewal fails gives up its subscriptions rather than carrying on with
+  a claim it can no longer prove.
+- A pod that cannot read its service account token **exits at startup**. Two
+  replicas that each believe they are the only subscriber is the failure this
+  mechanism exists to prevent, and it is invisible from outside — better a
+  `CrashLoopBackOff` with the reason in the log.
+- No `client-go`: `get`, `create` and `update` on one Lease object over HTTPS with
+  the pod's own token, a few requests an hour per pod.
+
 ## Design
 
 `main` wires four things, and they only meet in one place — `hub.Handle` (inbound)
@@ -329,6 +363,7 @@ and `hub.emit` (outbound):
 | `buzz.go` | Buzz channels: discover, subscribe, mention to prompt, prompt to channel message |
 | `http.go` | `POST /v1/messages`, SSE stream, bearer auth, `/v1/chat/completions` |
 | `registry.go` | Agent config, keys, per-peer NIP-44 key cache |
+| `leader.go` | The Kubernetes Lease that decides which replica subscribes to the relays |
 
 OpenCode's `:4096` is never exposed. The gateway calls it cluster-internal and
 republishes under its own protocol.
@@ -351,6 +386,11 @@ republishes under its own protocol.
   one request per id. There is no rate limit and no cap either.
 - The Nostr subscription only looks 5 seconds back, so a gateway restart misses
   messages sent while it was down. Same for a Buzz channel subscription.
+- A replica handover costs messages, not duplicates: the Lease is renewed every
+  5s against a 15s duration, and the new holder only subscribes once the old
+  claim has expired, so up to ~15s of inbound traffic — plus everything the
+  previous holder was holding in memory — is gone. Nothing is answered twice,
+  which is the trade; a durable relay cursor is the fix if 15s matters.
 - A relay may deliver one event more than once, and this gateway re-opens both of
   its subscriptions — the encrypted one on every dropped connection, the channel
   one every refresh. Relays hand a new subscription everything they still store,
@@ -360,6 +400,12 @@ republishes under its own protocol.
   is per pod and per process: two replicas sharing an agent each keep their own
   window, so the duplicate suppression that spans replicas is leader election
   (`deploy/k8s.yaml`), not this map.
+- The HTTP API's state is per pod: `POST /v1/messages` and the
+  `GET /v1/conversations/{id}/events` stream that follows it have to reach the same
+  replica, which is what `sessionAffinity: ClientIP` on the Service is for.
+  `/v1/chat/completions` needs no affinity — one request carries its own answer
+  back. Conversations held by the replica that just lost the relay lease are gone
+  with it.
 - `allow` is not a relay-side filter, and neither is a channel or kind
   narrowing, so the relay streams every event in the subscribed kinds to the
   gateway and the gateway discards the ones it does not want. A busy channel with
@@ -430,7 +476,9 @@ discovery recovering from a refused NIP-42 handshake, a Buzz discovery on a rela
 that is also a `RELAYS` entry, the agent profile published before the agent
 is in any channel, a Buzz turn that reaches `completed` with nothing accumulated
 without taking the process down, and one relay carrying both roles in both
-directions, one relay event delivered twice reaching OpenCode once, a full Nostr
-round trip
+directions, one relay event delivered twice reaching OpenCode once, and the relay
+lease giving exactly one of two replicas the right to subscribe — including the
+handover after an expiry and the refusal of a pod to take a lease it has already
+handed back. A full Nostr round trip
 (NIP-44, kind, `p` tag routing, encrypted reply) against an in-process fake relay,
 including a relay that demands NIP-42 and authenticates each agent separately.
