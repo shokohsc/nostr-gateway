@@ -46,6 +46,17 @@ data:
       }
     }
   relays: "wss://nos.lol,wss://relay.damus.io"
+  # Buzz/NIP-29 relays, deliberately separate from `relays`. A relay may be
+  # named in both: the gateway then opens a second, agent-authenticated
+  # connection for Buzz, so the channel listener and the member-list discovery
+  # never answer a NIP-42 challenge on the same websocket.
+  #
+  # Empty is the documented off state, and it is off *silently* — with no Buzz
+  # pool the gateway subscribes to no channel at all, and an answer to a mention
+  # is published as a kind-30078 envelope instead, which a Buzz client does not
+  # render. That is the agent answering a message nobody can see. Wire this up to
+  # actually use channels.
+  buzz_relays: ""
 ---
 # The agent itself. Fields follow plan.md §10; check them against the
 # KubeOpenCode CRD version you actually run.
@@ -87,6 +98,16 @@ metadata:
     app: nostr-gateway
 spec:
   replicas: 1
+  # Recreate, not the default RollingUpdate. At replicas: 1 the default computes
+  # maxUnavailable 0 and maxSurge 1, so a rollout starts the new pod *before* it
+  # stops the old one — and for the length of that overlap two gateway processes
+  # hold the same nsec, authenticate as the same pubkey, and both carry a REQ for
+  # the same `p` tag. Every inbound message then becomes two prompts in two
+  # OpenCode sessions and the answer arrives twice. There is no leader election
+  # here and there should not be: the agent's key is one identity, so this stays
+  # one replica until each replica gets its own nsec.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: nostr-gateway
@@ -122,8 +143,25 @@ spec:
                 configMapKeyRef:
                   name: gateway-config
                   key: relays
+            - name: BUZZ_RELAYS
+              valueFrom:
+                configMapKeyRef:
+                  name: gateway-config
+                  key: buzz_relays
             - name: GATEWAY_ADDR
               value: ":8080"
+            # Debug, not the default info, because the lines that tell a dead
+            # subscription apart from a dropped message are all Debug:
+            # "buzz: inbound channel message" is the only proof on the success
+            # path that anything arrived, and "inbound message not for this agent"
+            # is the only proof that something arrived and was then refused. At
+            # info, "the relay never delivered it" and "the gateway got it and
+            # threw it away" are the same empty log — which is what made this
+            # deafness expensive to find rather than obvious.
+            # Narrow enough to keep: the listeners subscribe to kind 30078 and
+            # kind 9 only. Drop back to info once the fault is found.
+            - name: LOG_LEVEL
+              value: "debug"
             - name: GATEWAY_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -137,22 +175,48 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          # /healthz answers 200 unconditionally, so neither probe can see that
+          # the gateway has lost its relay subscriptions — a deaf pod stays in the
+          # Service and is never replaced. What these probes *can* do is the
+          # opposite harm, so they are tuned against it: a restart is this
+          # gateway's deafness, because conversations live in memory and the
+          # subscription only looks 5 seconds back.
           readinessProbe:
             httpGet:
               path: /healthz
               port: http
+            periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /healthz
               port: http
+            # 1s / 10s / 3 are the defaults and they are wrong for this process:
+            # a 32 MB per-SSE-line read (maxEventBytes, and README records that
+            # the line is read before it is measured) inside a memory limit and
+            # under a 500m CFS cap is enough to miss a one-second deadline three
+            # times inside thirty seconds, and the kubelet's answer to that is
+            # SIGTERM. Ten seconds of slack and five failures means ~150s of real
+            # unresponsiveness before a merely busy process is killed.
+            timeoutSeconds: 10
+            periodSeconds: 30
+            failureThreshold: 5
             initialDelaySeconds: 5
           resources:
             requests:
               cpu: 50m
-              memory: 64Mi
+              memory: 128Mi
             limits:
               cpu: 500m
-              memory: 256Mi
+              # 256Mi is under the gateway's own documented worst case:
+              # maxEventBytes is 32 MB per SSE line and README records that the
+              # line is read before it is measured, so 32 MB is a floor on one
+              # allocation rather than a bound on it. An OOMKill is SIGKILL —
+              # nothing is logged, the pod comes back and re-subscribes with five
+              # seconds of lookback, which reads as "it answered once and then went
+              # deaf" with a clean log.
+              # ponytail: a limit sized above the known allocation, not a fix for
+              # it; truncate tool output upstream if this ever has to be tight.
+              memory: 512Mi
           volumeMounts:
             - name: config
               mountPath: /etc/gateway
