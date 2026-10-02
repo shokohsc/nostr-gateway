@@ -253,6 +253,23 @@ that swallows its result makes the agent deaf with nothing in the log.
   copies that matter are the ones that arrive on the next one: every reconnect
   and, on the channel side, every `buzzRefresh`, where a relay replays everything
   it still stores.
+- **Exactly one replica subscribes to the relays, and `leader.go` is the only
+  thing that decides which.** `listeners` runs the listeners only while
+  `hold` says this process owns the Lease, so a replica that cannot renew stops
+  listening rather than carrying on with a claim it cannot prove. Do not start a
+  listener, a pool or a subscription anywhere else: one agent key is one
+  identity, and two subscribers prompt OpenCode twice for every message.
+  `listenAll` waits for every listener before a term ends — the listeners exit on
+  the term context, so a new term started while the old ones drain is the same
+  double subscription, arrived at differently.
+  The publish side deliberately has **no** gate of its own, and that is not an
+  oversight: `hub.emit` only reaches Nostr for a conversation with a Nostr reply
+  peer, only a relay event ever sets one, and only the subscriber sees relay
+  events. A follower has nothing to publish, and an HTTP caller — who has no peer
+  at all — is answered inside its own request. Add a follower-side publish
+  gate only together with the reasoning that made it necessary.
+  `n.lead` is nil when `LEASE_NAME` is unset, which means one replica: a
+  developer running the binary locally, and every test.
 - Every relay call on a listener's own goroutine carries `callTimeout`. A
   `context.Background()` publish to a relay that never answers stalls that
   agent's entire inbound stream — the listener is the only reader.
@@ -330,7 +347,10 @@ backpressure.
   history, so without cutting at the ack a continued conversation would answer
   with the previous turn. Do not replace that with a timestamp comparison.
 - In-memory only. No database, no eviction, no persistence — a restart drops
-  conversation→session state. Keep it that way unless asked.
+  conversation→session state. Keep it that way unless asked. The one piece of
+  shared state in the system is the Lease in `leader.go`, and it holds a pod name
+  and two timestamps; anything more in it is a distributed system arriving
+  without a decision to have one.
 - Config is static JSON (`AGENTS_FILE` or inline `AGENTS`), not a CRD watcher.
   The `ponytail:` comments in the source mark the deliberate shortcuts and name
   the upgrade path; read them before "improving" one.

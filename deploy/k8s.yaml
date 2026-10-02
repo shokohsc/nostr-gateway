@@ -8,6 +8,12 @@
 #
 # The OpenCode servers (:4096) are never exposed outside the cluster; only the
 # gateway's :8080 has a Service, and only for the plain-HTTP API.
+#
+# Two replicas, one of which does the relay work. Every replica serves the HTTP
+# API — a chat completion is answered inside its own request — but only the one
+# holding the `nostr-gateway` Lease subscribes to the relays, because an agent
+# key is one identity and two subscribers prompt OpenCode twice per message. See
+# README "Running more than one replica".
 ---
 apiVersion: v1
 kind: Namespace
@@ -56,6 +62,44 @@ data:
   # NIP-42 handshakes cannot collide on one websocket.
   relays: "wss://nos.lol,wss://relay.damus.io"
 ---
+# The only Kubernetes access the gateway has: one Lease, to tell replicas apart.
+# get and update are the renewals, create is the first claim. There is no watch
+# and no list — it polls its own claim every 5s against a 15s duration, which is
+# a few requests an hour per pod.
+#
+# `create` is the one verb resourceNames cannot narrow, because Kubernetes has
+# nothing to match a name against on a create, so this Role may create any Lease in
+# this namespace. The gateway only ever creates its own.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nostr-gateway
+  namespace: kubeopencode
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nostr-gateway
+  namespace: kubeopencode
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nostr-gateway
+  namespace: kubeopencode
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: nostr-gateway
+subjects:
+  - kind: ServiceAccount
+    name: nostr-gateway
+    namespace: kubeopencode
+---
 # The agent itself. Fields follow plan.md §10; check them against the
 # KubeOpenCode CRD version you actually run.
 apiVersion: kubeopencode.dev/v1alpha1
@@ -95,17 +139,19 @@ metadata:
   labels:
     app: nostr-gateway
 spec:
-  replicas: 1
-  # Recreate, not the default RollingUpdate. At replicas: 1 the default computes
-  # maxUnavailable 0 and maxSurge 1, so a rollout starts the new pod *before* it
-  # stops the old one — and for the length of that overlap two gateway processes
-  # hold the same nsec, authenticate as the same pubkey, and both carry a REQ for
-  # the same `p` tag. Every inbound message then becomes two prompts in two
-  # OpenCode sessions and the answer arrives twice. There is no leader election
-  # here and there should not be: the agent's key is one identity, so this stays
-  # one replica until each replica gets its own nsec.
+  replicas: 2
+  # RollingUpdate, which at replicas: 2 starts the new pod before stopping the
+  # old one. That overlap is exactly what used to be forbidden here: the two
+  # processes hold the same nsec, authenticate as the same pubkey, and both carry
+  # a REQ for the same `p` tag, so every inbound message became two prompts in two
+  # OpenCode sessions with the answer on the wire twice. The Lease is what makes
+  # the overlap safe now — one of the two holds it and subscribes, the other waits
+  # — so maxUnavailable stays 0 and a rollout never takes the relay side down.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: nostr-gateway
@@ -114,9 +160,23 @@ spec:
       labels:
         app: nostr-gateway
     spec:
-      # The gateway needs no Kubernetes API access: it reads its config from an
-      # env var and talks to OpenCode and the Nostr relays directly.
-      automountServiceAccountToken: false
+      serviceAccountName: nostr-gateway
+      # A restart of the pod holding the lease is a handover, so the grace period
+      # is longer than the 5s it needs to hand the Lease back: the next pod waits
+      # out the rest of the lease duration otherwise.
+      terminationGracePeriodSeconds: 20
+      # One gateway on one node is the outage this is meant to remove, so ask for
+      # a different node first. Preferred, not required: a single-node cluster
+      # still gets two replicas, just on the same node.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: nostr-gateway
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532 # distroless nonroot
@@ -143,6 +203,26 @@ spec:
                   key: relays
             - name: GATEWAY_ADDR
               value: ":8080"
+            # Who does the relay work. The replica that wins this Lease
+            # subscribes to the relays and publishes answers, the other one serves
+            # the HTTP API and stands by; the winner is in the log as
+            # "relay lease held: this replica subscribes to the relays". A pod
+            # that cannot read the service account token exits instead of serving
+            # an API and subscribing to nothing, which would be two deaf pods and
+            # no log that says why.
+            - name: LEASE_NAME
+              value: "nostr-gateway"
+            # The claim is per pod, not per Deployment: two pods on one lease name
+            # is the race the Lease resolves, and POD_NAME is what tells them
+            # apart. POD_NAMESPACE is the namespace the Lease lives in.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             # Debug, not the default info, because the lines that tell a dead
             # subscription apart from a dropped message are all Debug:
             # "buzz: inbound channel message" is the only proof on the success
@@ -173,7 +253,10 @@ spec:
           # Service and is never replaced. What these probes *can* do is the
           # opposite harm, so they are tuned against it: a restart is this
           # gateway's deafness, because conversations live in memory and the
-          # subscription only looks 5 seconds back.
+          # subscription only looks 5 seconds back. That is now a handover rather
+          # than an outage for the pod holding the Lease, and nothing at all for
+          # the one standing by, but a probe cannot tell the two apart — /healthz
+          # is deliberately not a readiness signal for the relay side.
           readinessProbe:
             httpGet:
               path: /healthz
@@ -227,7 +310,27 @@ metadata:
 spec:
   selector:
     app: nostr-gateway
+  # ClientIP, so a client that POSTs a message and then follows the SSE stream of
+  # that conversation lands on the pod that has it in memory. Without it the two
+  # requests can hit different replicas and the stream starts empty — the
+  # conversation map is per process and is not shared. /v1/chat/completions needs
+  # none of this: it is one request that carries its own answer back.
+  sessionAffinity: ClientIP
   ports:
     - name: http
       port: 80
       targetPort: http
+---
+# Keep one gateway up through a node drain or a voluntary disruption. Only the
+# lease holder's absence is a real outage, and minAvailable 1 is what keeps a second
+# pod in the rollout.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nostr-gateway
+  namespace: kubeopencode
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: nostr-gateway

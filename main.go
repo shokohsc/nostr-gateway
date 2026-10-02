@@ -27,9 +27,14 @@ func main() {
 
 	token := os.Getenv("GATEWAY_TOKEN")
 	relays := relayList(log)
+	lead, err := leaderElection(log)
+	if err != nil {
+		log.Error("relay lease", "err", err)
+		os.Exit(1)
+	}
 	log.Info("relays", "relays", strings.Join(relays, ","),
 		"roles", "encrypted kind-30078 envelopes in and out, Buzz channels read and answered, agent profile and presence published")
-	nt := newNostrTransport(ctx, relays, reg, h, log)
+	nt := newNostrTransport(ctx, relays, reg, h, lead, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)

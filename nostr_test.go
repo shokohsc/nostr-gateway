@@ -400,7 +400,7 @@ func TestNostrRoundTrip(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -484,7 +484,7 @@ func TestNostrPermissionReply(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -547,7 +547,7 @@ func TestNostrAllowList(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -587,7 +587,7 @@ func TestHTTPCannotRedirectNostrReplies(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -643,7 +643,7 @@ func TestNostrRoutesByPTag(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -685,7 +685,7 @@ func TestNostrAuthenticatesPerAgentOnAClosedRelay(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -753,7 +753,7 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -894,7 +894,7 @@ func TestBuzzMentionsAndDMsReachOpenCode(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url(), buzz.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url(), buzz.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -974,7 +974,7 @@ func TestBuzzAnswerIsPostedBackIntoTheChannel(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url(), buzz.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url(), buzz.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -1051,7 +1051,7 @@ func TestBuzzIgnoresItsOwnChannelReplies(t *testing.T) {
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(context.Background(), nil, reg, h, log)
+	nt := newNostrTransport(context.Background(), nil, reg, h, nil, log)
 
 	// The agent's own kind-9, in a two-member channel, addressed to the agent.
 	own := buzzMessage(t, ask, "h", "channel-dm", apk, "the agent's own answer")
@@ -1084,7 +1084,7 @@ func TestBuzzRefusalsNameTheFault(t *testing.T) {
 
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	nt := newNostrTransport(context.Background(), nil, reg, newHub(reg, log), log)
+	nt := newNostrTransport(context.Background(), nil, reg, newHub(reg, log), nil, log)
 	chans := buzzChannels{"channel-dm": 2, "channel-group": 5}
 
 	nt.buzzReceive(context.Background(), agent,
@@ -1140,7 +1140,7 @@ func TestBuzzDiscoverySurvivesALostNIP42Handshake(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url(), buzz.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url(), buzz.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -1186,7 +1186,7 @@ func TestBuzzDiscoveryOnARelaySharedWithTheMessageListener(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -1239,7 +1239,7 @@ func TestBuzzProfileIsPublishedWhenNoRosterNamesTheAgent(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -1310,7 +1310,7 @@ func TestOneRelayListServesBothRoles(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 	go nt.run(ctx)
@@ -1420,7 +1420,7 @@ func TestOneRelayEventIsOnePrompt(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHub(reg, log)
-	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, nil, log)
 	h.nostr = nt
 	go h.run(ctx)
 
