@@ -201,6 +201,16 @@ export RELAYS='wss://nos.lol,ws://buzz.example.internal:3000'
   message and the name the agent's own answers carry, so it is the one the relay
   routes on. The gateway still reads the channel from `h` or `d` and checks
   membership itself, so nothing about *whether to answer* moves into the filter.
+- The kind-9 listener sends a second REQ that names **no** channel, because the
+  relay takes a channel off `h` alone: a message with no `h` tag, or one whose `h`
+  is not a uuid, is stored with no channel and goes only to subscriptions that
+  name none. That message used to be unreachable — the relay logged it ingested,
+  the gateway logged that it asked for channel messages, and nothing decided
+  anything. It is now delivered and the channel is resolved and checked here, so an
+  event the agent may not answer is logged rather than silently dropped. The two
+  REQs are separate on purpose: a relay reading one filter without `#h` widens the
+  whole subscription to global scope, which would end delivery of the channel
+  messages the first one hears.
 - Nothing the gateway decides goes into a filter, `authors` included: a blocked
   sender dropped by the relay never reaches the `allow` check that would have
   named it. That decision, and the mention check, are logged where they happen.
