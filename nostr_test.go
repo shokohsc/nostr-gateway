@@ -57,10 +57,11 @@ type fakeRelay struct {
 	published []int          // kinds the gateway pushed here, as opposed to broadcast
 	posts     []*nostr.Event // the same events, whole, for tag and content assertions
 	opened    int            // websocket connections ever accepted
-	// filters records what each REQ actually asked for. The relay does not
-	// enforce filters, which is what lets these tests inject anything from
-	// anyone, so without this the one part of a filter that matters in
-	// production — the relay-side narrowing — is invisible to every test here.
+	// filters records what each REQ actually asked for. The relay enforces one
+	// narrowing only (relayRoutes, the `#h` scope), so these tests can still
+	// inject anything from anyone, and without this the part of a filter that
+	// matters most in production — what the relay is asked to route — is
+	// invisible to every test here.
 	filters []nostr.Filter
 }
 
@@ -215,6 +216,9 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 			stored := append([]*nostr.Event(nil), r.stored...)
 			r.mu.Unlock()
 			for _, ev := range stored {
+				if !relayRoutes(f, ev) {
+					continue
+				}
 				c.write([]any{"EVENT", subID, ev})
 			}
 			c.write([]any{"EOSE", subID})
@@ -732,6 +736,11 @@ func TestNostrAuthenticatesPerAgentOnAClosedRelay(t *testing.T) {
 // Everything the gateway *decides* — allow, membership, the mention — stays in
 // buzzReceive and receive(), where a refusal can be named. That is the line this
 // test draws: the filter may address, never adjudicate.
+//
+// The kind-9 listener sends both halves, because neither one covers the other: a
+// scoped REQ hears what the relay routed to a channel and a channel-less one
+// hears what it could not route, and the relay keeps the two subscriptions in
+// separate scopes so nothing arrives twice.
 // ponytail: a relay filtering a large public channel set would make the wide
 // fan-out expensive; a periodic self-REQ to prove delivery buys it back.
 func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
@@ -763,7 +772,8 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 	relay.store = true
 	relay.inject(buzzMembers(t, nostr.GeneratePrivateKey(), reg.byName["frontend-agent"].PubKey, "chan-1", 2))
 
-	// One subscription per role: kind-30078, and the Buzz channel filter.
+	// One subscription per role, and two for the Buzz listener: the kind-30078
+	// envelope, the channel-scoped kind 9 and its channel-less companion.
 	waitFor(t, "both transports subscribed", func() bool {
 		relay.mu.Lock()
 		defer relay.mu.Unlock()
@@ -775,11 +785,12 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 				}
 			}
 		}
-		return len(relay.filters) >= 2 && chat >= 1
+		return len(relay.filters) >= 3 && chat >= 2
 	})
 
 	relay.mu.Lock()
 	defer relay.mu.Unlock()
+	var scoped, unrouted int
 	for i, f := range relay.filters {
 		listener := false
 		for _, k := range f.Kinds {
@@ -798,10 +809,25 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 			t.Errorf("REQ %d asks the relay for authors %v: a blocked sender is dropped "+
 				"by the relay and the gateway never logs the refusal", i, f.Authors)
 		}
-		if hasKind(f, buzzChatKind) && len(f.Tags["h"]) == 0 {
-			t.Errorf("REQ %d asks for kind 9 with no #h: Buzz's relay delivers a channel "+
-				"message only to the subscriptions naming that channel, so this one gets "+
-				"nothing at all and logs nothing either", i)
+		if hasKind(f, buzzChatKind) {
+			// Exactly two, and they are not interchangeable: the scoped one can
+			// hear only what the relay routed to a channel, the unrouted one only
+			// what it could not route. Between them every kind 9 the relay holds
+			// is either delivered or refused in buzzReceive, which logs it.
+			switch len(f.Tags["h"]) {
+			case 0:
+				if len(f.Tags) != 0 {
+					t.Errorf("REQ %d asks for kind 9 with no #h but with tags %v: a relay "+
+						"reads one filter without #h as global scope and then delivers only "+
+						"the events it could not route to a channel", i, f.Tags)
+				}
+				unrouted++
+			default:
+				if !slices.Equal(f.Tags["h"], []string{"chan-1"}) {
+					t.Errorf("REQ %d asks for channels %v, want the discovered [chan-1]", i, f.Tags["h"])
+				}
+				scoped++
+			}
 		}
 		for tag, vals := range f.Tags {
 			// The addressing that stays, because the relay routes on it: `#p` for
@@ -812,15 +838,38 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 				continue
 			}
 			if tag == "h" && hasKind(f, buzzChatKind) {
-				if !slices.Equal(vals, []string{"chan-1"}) {
-					t.Errorf("REQ %d asks for channels %v, want the discovered [chan-1]", i, vals)
-				}
-				continue
+				continue // the exact value was asserted above, per REQ
 			}
 			t.Errorf("REQ %d asks the relay for %s in %v: the relay drops a non-match "+
 				"before delivery, so a wrong tag name is silence, not a message", i, tag, vals)
 		}
 	}
+	if scoped != 1 || unrouted != 1 {
+		t.Errorf("kind-9 REQs: %d scoped, %d unrouted, want one of each — a message the "+
+			"relay could not route to a channel reaches the gateway on one or neither", scoped, unrouted)
+	}
+}
+
+// relayRoutes is the one narrowing a real relay applies before delivery, and it
+// is the one the Buzz deafness is made of: a subscription naming channels in #h
+// receives only the events naming one of them, and a subscription naming no
+// channel receives only the events naming none (buzz-relay keeps a
+// channel-scoped subscription and a global one in separate scopes, and its
+// channel id comes from the `h` tag alone). Handing every stored event to every
+// subscriber makes the two subscriptions indistinguishable, so a REQ the relay
+// would answer with nothing looks here like one it answers with everything —
+// which is how a `#h`-only listener passed every test in this file while a
+// message the relay could not route never reached the gateway.
+//
+// Live broadcast is still unconditional, which is why every test publishes
+// before it starts the gateway; a broadcast has no filter to apply because the
+// fake stores the sub ids, not the filters.
+func relayRoutes(f nostr.Filter, ev *nostr.Event) bool {
+	h := f.Tags["h"]
+	if len(h) == 0 {
+		return tagValue(ev.Tags, "h") == ""
+	}
+	return slices.Contains(h, tagValue(ev.Tags, "h"))
 }
 
 func hasKind(f nostr.Filter, kind int) bool {
@@ -837,11 +886,10 @@ func hasKind(f nostr.Filter, kind int) bool {
 // addressable whichever its author used.
 //
 // The end-to-end version of this — a `d`-only chat message reaching OpenCode —
-// is gone by necessity and not by accident: the kind-9 REQ names the channel
-// under `h`, because that is what Buzz's relay routes on, and a filter-ignoring
-// relay still drops a `d`-only event client-side in go-nostr's Filter.Matches.
-// So a `d`-only chat message is unreachable by design now. The filter is not
-// what can be given up: without it the agent hears no channel at all.
+// needs the channel-less half of the listener, because a relay takes the channel
+// id off `h` and a message with none of those is stored with no channel at all,
+// where only a subscription naming no channel can hear it. That is
+// TestBuzzChatMessageTheRelayCouldNotRouteReachesOpenCode.
 func TestBuzzChannelTagAcceptsEitherName(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -856,6 +904,57 @@ func TestBuzzChannelTagAcceptsEitherName(t *testing.T) {
 		if got := buzzChannelTag(tc.tags); got != tc.want {
 			t.Errorf("%s: buzzChannelTag = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// A kind-9 chat message the relay could not route to a channel: the channel name
+// is under `d`, and a relay reads a channel off `h` alone, so it stores the event
+// with no channel and can only hand it to a subscription that names no channel.
+// Before the channel-less half of the listener, that message was deafness with
+// nothing to look at: the relay logged it ingested, the gateway logged that it
+// asked for channel messages, and no line anywhere said the two did not meet. The
+// answer still goes back under `h`, because buzzPost writes what NIP-29 says a
+// chat message carries.
+func TestBuzzChatMessageTheRelayCouldNotRouteReachesOpenCode(t *testing.T) {
+	f := newFakeOC(t)
+	relay := newFakeRelay(t)
+	relay.requireAuth = true
+	relay.store = true
+
+	usk := nostr.GeneratePrivateKey()
+	ask := nostr.GeneratePrivateKey()
+	apk, _ := nostr.GetPublicKey(ask)
+	agent := &Agent{Name: "frontend-agent", OpenCode: f.URL, PubKey: apk, sk: ask, ck: map[string][32]byte{}}
+	reg := &Registry{byName: map[string]*Agent{agent.Name: agent}}
+
+	group := "channel-unrouted"
+	relay.inject(buzzMembers(t, usk, apk, group, 2))
+	relay.inject(buzzMessage(t, usk, "d", group, apk, "@frontend-agent named under d only"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	h.nostr = nt
+	go h.run(ctx)
+	go nt.run(ctx)
+
+	waitFor(t, "the unroutable mention", func() bool { _, p, _ := f.counts(); return p == 1 })
+	// The channel came from `d` on both events: the member list names it, and the
+	// message names it, so the turn belongs to the channel the agent is in.
+	if h.convs.get(buzzConversation(group)) == nil {
+		t.Fatalf("no conversation for %s: the channel name was not read off the message", group)
+	}
+
+	f.push("message.part.updated", map[string]any{
+		"sessionID": "ses_1", "delta": "heard you",
+		"part": map[string]any{"id": "prt_1", "type": "text", "sessionID": "ses_1", "messageID": "msg_asst"},
+	})
+	f.push("session.idle", map[string]any{"sessionID": "ses_1"})
+	waitFor(t, "the answer", func() bool { return len(relay.postsOf(buzzChatKind)) == 1 })
+	if got := tagValue(relay.postsOf(buzzChatKind)[0].Tags, "h"); got != group {
+		t.Fatalf("h tag %q, want %q", got, group)
 	}
 }
 

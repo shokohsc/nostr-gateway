@@ -6,6 +6,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -223,63 +224,93 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 			n.log.Info("buzz channels", "agent", a.Name, "channels", joined)
 		}
 
-		filter := nostr.Filter{
-			Kinds: []int{buzzChatKind},
-			// The channels the agent is a member of, and nothing else: see the
-			// `#h` note below.
-			Tags: nostr.TagMap{"h": ids},
-			// This is addressing, not narrowing, and the difference is the whole
-			// bug it fixes. Buzz's relay fans a channel message out per
-			// subscription and hands it to the subscriptions that *name* that
-			// channel, so a kind-9 REQ with only `kinds` receives nothing at all
-			// — not the wrong channels, none: the agent is deaf in every channel
-			// while the relay logs the message as ingested and the gateway logs
-			// nothing, because nothing arrived to be refused. This is why
-			// discovery runs first (ids is what it returned) and why removing
-			// this tag "because it is only a guess" was the wrong call.
-			//
-			// `h` is the name NIP-29 gives a channel on a kind-9 chat message,
-			// and it is what buzzPost writes, so a message this relay routes
-			// carries it. The `d` tolerance is not lost by asking for `h`:
-			// buzzChannelTag still reads either name gateway-side, which is what
-			// covers a relay that publishes chats under `d` — a relay that did
-			// would also be unable to route those messages to a channel-scoped
-			// subscription at all, so the filter costs nothing there.
-			//
-			// What still never goes in a filter: `authors`, and any tag the
-			// gateway would otherwise use to decide something. allow, membership
-			// and the mention are all decided in buzzReceive, where a refusal can
-			// be logged. See AGENTS.md, and the same rule on nostr.listen.
-			// ponytail: one REQ per refresh covering every channel the agent is
-			// in; per-channel REQs buy nothing, because the answer is filtered
-			// by channel anyway.
-			// The same 5s slack as the kind-30078 subscription: a longer Since
-			// would replay channel history into brand-new OpenCode sessions.
-			Since: ptr(nostr.Now() - 5),
+		// Two REQs, because the relay's routing question and the gateway's are
+		// not the same one, and the relay only answers the first.
+		reqs := []nostr.Filter{
+			{
+				Kinds: []int{buzzChatKind},
+				// The channels the agent is a member of, and nothing else: see the
+				// `#h` note below.
+				Tags: nostr.TagMap{"h": ids},
+				// This is addressing, not narrowing, and the difference is the whole
+				// bug it fixes. Buzz's relay fans a channel message out per
+				// subscription and hands it to the subscriptions that *name* that
+				// channel, so a kind-9 REQ with only `kinds` receives nothing at all
+				// — not the wrong channels, none: the agent is deaf in every channel
+				// while the relay logs the message as ingested and the gateway logs
+				// nothing, because nothing arrived to be refused. This is why
+				// discovery runs first (ids is what it returned) and why removing
+				// this tag "because it is only a guess" was the wrong call.
+				//
+				// `h` is the name NIP-29 gives a channel on a kind-9 chat message,
+				// and it is what buzzPost writes, so a message this relay routes
+				// carries it. What it cannot hear is the second REQ's: see below.
+				//
+				// What still never goes in a filter: `authors`, and any tag the
+				// gateway would otherwise use to decide something. allow, membership
+				// and the mention are all decided in buzzReceive, where a refusal can
+				// be logged. See AGENTS.md, and the same rule on nostr.listen.
+				// ponytail: one REQ per refresh covering every channel the agent is
+				// in; per-channel REQs buy nothing, because the answer is filtered
+				// by channel anyway.
+				// The same 5s slack as the kind-30078 subscription: a longer Since
+				// would replay channel history into brand-new OpenCode sessions.
+				Since: ptr(nostr.Now() - 5),
+			},
+			{
+				// A kind 9 the relay could not route to a channel: no `h` tag at
+				// all, or one it cannot read as a channel uuid (its
+				// `extract_channel_id` is the `h` tag, and nothing else). The
+				// relay stores such an event with no channel, and hands it to the
+				// subscriptions that name no channel — which is what a filter
+				// without `#h` is, so this REQ is the only one that can hear it.
+				// The `#h` REQ above cannot, by construction, and that is the
+				// whole bug: the relay logs the message ingested, the gateway
+				// logs that it asked for channel messages every minute, and
+				// nothing decides anything, so the case is invisible from both
+				// ends. buzzReceive decides which channel it belongs to and logs
+				// the ones it refuses.
+				//
+				// Two REQs and not one REQ carrying both filters, because a relay
+				// that finds a filter without `#h` widens the whole subscription
+				// to global scope (`extract_channel_ids_from_filters` returns
+				// None), and then the channel messages only the first REQ can
+				// hear stop arriving. The pair is disjoint: the relay keeps a
+				// channel-scoped subscription and a global one apart, so no
+				// message arrives twice.
+				Kinds: []int{buzzChatKind},
+				Since: ptr(nostr.Now() - 5),
+			},
 		}
-		// The REQ that carries this filter goes out on every refresh, but a
+		// The REQs that carry these filters go out on every refresh, but a
 		// refresh that changes nothing logs nothing, so a silent gateway is
 		// indistinguishable from a healthy one. Log what it last asked for,
 		// and whether messages will be refused: compared against the relay's
 		// own publish log, that is the difference between a message the relay
 		// never delivered and one the gateway refused (which buzzReceive logs).
 		n.log.Debug("buzz: asked for channel messages", "agent", a.Name,
-			"channels", len(ids), "allow_list", len(a.Allow) > 0, "relays", n.relays)
-		// The subscription gets its own context so a refresh can end it on the
+			"channels", len(ids), "unrouted_req", true,
+			"allow_list", len(a.Allow) > 0, "relays", n.relays)
+		// The subscriptions get their own context so a refresh can end them on the
 		// wire: go-nostr turns a cancelled context into a NIP-01 CLOSE, and
-		// leaving the old REQ open would keep the relay fanning out to a stale
+		// leaving the old REQs open would keep the relay fanning out to a stale
 		// channel list once a minute, forever.
 		subCtx, endSub := context.WithCancel(ctx)
-		ended := make(chan struct{})
-		go func() {
-			defer close(ended)
-			for ie := range pool.SubscribeMany(subCtx, n.relays, filter) {
-				if ie.Event == nil {
-					continue // EOSE
+		var listening sync.WaitGroup
+		for _, filter := range reqs {
+			listening.Add(1)
+			go func() {
+				defer listening.Done()
+				for ie := range pool.SubscribeMany(subCtx, n.relays, filter) {
+					if ie.Event == nil {
+						continue // EOSE
+					}
+					n.buzzReceive(ctx, a, ie.Event, chans)
 				}
-				n.buzzReceive(ctx, a, ie.Event, chans)
-			}
-		}()
+			}()
+		}
+		ended := make(chan struct{})
+		go func() { listening.Wait(); close(ended) }()
 
 		select {
 		case <-time.After(buzzRefresh):
@@ -365,8 +396,10 @@ func (n *nostrTransport) buzzReceive(ctx context.Context, a *Agent, ev *nostr.Ev
 	// simply not addressed to the agent: either the sender's key is not in the
 	// allow list, or the channel it was sent in is not one the agent is a member
 	// of, and in both cases the agent is deaf until someone changes a file and
-	// restarts. So they log at Warn with the fix in the message. The two further
-	// down are ordinary group-chat traffic and stay at Debug — see drop.
+	// restarts. So they log at Warn with the fix in the message — once per
+	// channel, because the channel-less REQ brings messages for channels this
+	// agent is not in along with every refresh. The two further down are
+	// ordinary group-chat traffic and stay at Debug — see drop.
 	if !a.allows(ev.PubKey) {
 		n.log.Warn("buzz: inbound message from a pubkey the agent does not allow",
 			"agent", a.Name, "from", shortPub(ev.PubKey), "allow", len(a.Allow),
@@ -376,9 +409,13 @@ func (n *nostrTransport) buzzReceive(ctx context.Context, a *Agent, ev *nostr.Ev
 	channel := buzzChannelTag(ev.Tags)
 	members, member := chans[channel]
 	if !member {
-		n.log.Warn("buzz: inbound message in a channel the agent is not in",
+		// warnOnce, not Warn: a message the relay could not route to a channel
+		// arrives on the channel-less REQ above, so this is the line that turns
+		// that silence into a log, and a busy workspace would say it once per
+		// event for every channel the agent is not in.
+		n.warnOnce(a, "not-in-channel-"+channel, "buzz: inbound message in a channel the agent is not in",
 			"agent", a.Name, "channel", channel, "in", strings.Join(slices.Sorted(maps.Keys(chans)), ","),
-			"hint", "add the agent to that channel, or send in one it is in: a NIP-29 subscription only receives a channel it names in #h")
+			"hint", "add the agent to that channel, or send in one it is in: the relay only routes a channel message to the subscriptions that name it")
 		return
 	}
 	// In a two-member channel every message is addressed to the agent, which is
