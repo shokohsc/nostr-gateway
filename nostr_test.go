@@ -867,7 +867,7 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 func relayRoutes(f nostr.Filter, ev *nostr.Event) bool {
 	h := f.Tags["h"]
 	if len(h) == 0 {
-		return len(ev.Tags.GetAll(nostr.Tag{"h"})) == 0
+		return tagValue(ev.Tags, "h") == ""
 	}
 	return slices.Contains(h, tagValue(ev.Tags, "h"))
 }
