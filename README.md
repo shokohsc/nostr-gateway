@@ -69,8 +69,10 @@ The mapping is deliberately lossy in one direction: OpenAI has no way to express
 a tool call, a progress event or a permission request, so the response carries
 the answer text and nothing else. Anything more than the answer comes back over
 the protocol stream above. That is also why this surface is not how a permission
-request is answered — a client here cannot approve one, and the request arrives
-as an error rather than a hang.
+request is answered — a client here cannot approve one, so a turn that raises one
+comes back as `502` naming the request, never as `200` with the request's title
+wearing the model's hat. A turn that fails comes back the same way: `502` with
+the original error text, not `200` + `finish_reason:"stop"` + empty content.
 
 ## Protocol
 
@@ -414,11 +416,14 @@ go test ./...
 Covers the prompt flow end to end over HTTP, the permission approval loop on
 both OpenCode API generations, session reuse (including four simultaneous first
 messages creating exactly one session), cross-agent conversation rejection, the
-reducer's delta/dedupe rules, replay for late SSE subscribers, the OpenAI surface
+reducer's delta/dedupe rules (including that a whitespace-only delta still emits
+its break), replay for late SSE subscribers, the OpenAI surface
 (`/v1/models`, a non-streaming completion, a streamed one ending in `[DONE]`, an
-unknown model rejected, and a continued conversation not carrying the previous
-turn's answer), protocol version
-and body-size rejection, an oversized event surviving the stream, the allow list
+unknown model rejected, a continued conversation not carrying the previous
+turn's answer, a failed turn answering `502` instead of an empty `200`, and a
+pending permission answering `502` instead of posing as the answer), protocol
+version and body-size rejection, an oversized event surviving the stream, the
+allow list
 on the Nostr path and the absence of *any* relay-side filter that could swallow
 an event before the gateway could log it (the `p` address tag excepted, and a
 kind-9 message tagged with `d` reaching OpenCode), HTTP being unable to redirect
@@ -430,6 +435,15 @@ to `RELAYS`, the agent not answering its own channel replies, a Buzz
 discovery recovering from a refused NIP-42 handshake, a Buzz discovery on a relay
 that is also a `RELAYS` entry, the agent profile published before the agent
 is in any channel, a Buzz turn that reaches `completed` with nothing accumulated
-without taking the process down, and a full Nostr round trip
+without taking the process down, a resubscribe rebuilding its `since` filter
+instead of replaying everything since startup, the shared `warned`/`profiled`
+maps being safe across agents, and a full Nostr round trip
 (NIP-44, kind, `p` tag routing, encrypted reply) against an in-process fake relay,
 including a relay that demands NIP-42 and authenticates each agent separately.
+
+```bash
+go test -race ./...
+```
+
+runs the same suite under the race detector, minus `nostr_test.go` — see
+`Known limits`.

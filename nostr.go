@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -49,10 +50,17 @@ type nostrTransport struct {
 	// Warn, so a state that repeats every minute is said once loudly and then at
 	// debug. Same one-writer-per-key rule as profiled.
 	warned map[string]bool
-	reg    *Registry
-	hub    *hub
-	log    *slog.Logger
-	out    chan job
+	// stateMu guards warned and profiled. "One writer per key" is not a safe
+	// rule for a Go map: both maps are shared across every agent's buzzListen
+	// goroutine, and a grow in one goroutine relocates the buckets another is
+	// reading. Disjoint keys do not make concurrent access to one map legal —
+	// it is a race with two agents, and the runtime terminates the process on
+	// it rather than corrupting a value.
+	stateMu sync.Mutex
+	reg     *Registry
+	hub     *hub
+	log     *slog.Logger
+	out     chan job
 }
 
 // job is one outbound envelope. buzz is the channel uuid when the conversation
@@ -167,30 +175,37 @@ func (n *nostrTransport) worker(ctx context.Context) {
 // a closed relay reaches the second REQ without help from here.
 func (n *nostrTransport) listen(ctx context.Context, a *Agent) {
 	pool := n.pools[a.Name]
-	filter := nostr.Filter{
-		Kinds: []int{messageKind},
-		// The p tag is the addressing, not a narrowing: a kind-30078 envelope is
-		// a message to one agent, and the relay matches `#p` to decide who gets
-		// it. go-nostr applies the same filter client-side, so this is enforced
-		// twice and dropping it here would hand every agent on the relay every
-		// other agent's mail — receive() would decrypt it, because the
-		// conversation key comes from the sender and the agent, not from the tag.
-		// receive() checks the tag as well, so a client that does not tag `p` for
-		// this agent produces a log line instead of silence.
-		//
-		// `authors` must never go here, and neither may any other tag: a relay
-		// applies those before delivery, so nothing runs and nothing logs, and
-		// the only evidence is the relay's own view of a REQ. That cost a day for
-		// the allow list, which belongs in allows() and nowhere else.
-		// A small Since avoids replaying a fresh deployment's stored history
-		// into brand-new OpenCode sessions. ponytail: a few seconds of slack
-		// because relay clocks differ; a durable cursor is the upgrade.
-		Tags:  nostr.TagMap{"p": []string{a.PubKey}},
-		Since: ptr(nostr.Now() - 5),
-	}
 	interval := reconnectBase
 	for ctx.Err() == nil {
 		connected := time.Now()
+		// Built inside the loop, not outside it. A filter constructed once
+		// carried its original `Since` for the life of the process, so every
+		// resubscribe asked the relay for everything published since startup
+		// and replayed it: months of stored history decrypted and re-prompted
+		// into the session, one duplicate answer per event, from one relay
+		// restart. `buzzListen` has always rebuilt its own filter per pass;
+		// this one did not, and nothing in the tests ever resubscribes.
+		filter := nostr.Filter{
+			Kinds: []int{messageKind},
+			// The p tag is the addressing, not a narrowing: a kind-30078 envelope is
+			// a message to one agent, and the relay matches `#p` to decide who gets
+			// it. go-nostr applies the same filter client-side, so this is enforced
+			// twice and dropping it here would hand every agent on the relay every
+			// other agent's mail — receive() would decrypt it, because the
+			// conversation key comes from the sender and the agent, not from the tag.
+			// receive() checks the tag as well, so a client that does not tag `p` for
+			// this agent produces a log line instead of silence.
+			//
+			// `authors` must never go here, and neither may any other tag: a relay
+			// applies those before delivery, so nothing runs and nothing logs, and
+			// the only evidence is the relay's own view of a REQ. That cost a day for
+			// the allow list, which belongs in allows() and nowhere else.
+			// A small Since avoids replaying a fresh deployment's stored history
+			// into brand-new OpenCode sessions. ponytail: a few seconds of slack
+			// because relay clocks differ; a durable cursor is the upgrade.
+			Tags:  nostr.TagMap{"p": []string{a.PubKey}},
+			Since: ptr(nostr.Now() - 5),
+		}
 		for ie := range pool.SubscribeMany(ctx, n.relays, filter) {
 			if ie.Event == nil {
 				continue
@@ -240,16 +255,19 @@ func (n *nostrTransport) receive(ctx context.Context, a *Agent, ev *nostr.Event)
 	if in.Agent == "" {
 		in.Agent = a.Name
 	}
-	conv := in.Conversation
-	if conv == "" {
-		conv = newID("conv")
+	// Minted here rather than left for Handle: Handle mints its own when the
+	// envelope carries none, and the failure reply below then named a
+	// conversation the gateway had never registered — the sender's retry opened
+	// a second conversation and a second OpenCode session, orphaning the first.
+	if in.Conversation == "" {
+		in.Conversation = newID("conv")
 	}
 	if _, err := n.hub.Handle(ctx, a, in, ev.PubKey); err != nil {
 		// A protocol is asynchronous, so a rejected message must come back as
 		// an answer, not as silence the sender cannot distinguish from a lost
 		// relay event.
 		n.reply(a, ev.PubKey, Envelope{
-			V: protocolVersion, Conversation: conv, Agent: a.Name, Sender: a.npub(),
+			V: protocolVersion, Conversation: in.Conversation, Agent: a.Name, Sender: a.npub(),
 			Type: TypeError, Timestamp: time.Now().UTC(),
 			Payload: Payload{Error: err.Error(), Text: err.Error()},
 		})
@@ -370,11 +388,14 @@ func (n *nostrTransport) publishTo(ctx context.Context, pool *nostr.SimplePool, 
 func (n *nostrTransport) warnOnce(a *Agent, fault, msg string, args ...any) {
 	key := a.Name + "|" + fault
 	args = append([]any{"agent", a.Name}, args...)
-	if n.warned[key] {
+	n.stateMu.Lock()
+	first := !n.warned[key]
+	n.warned[key] = true
+	n.stateMu.Unlock()
+	if !first {
 		n.log.Debug(msg, args...)
 		return
 	}
-	n.warned[key] = true
 	n.log.Warn(msg, args...)
 }
 

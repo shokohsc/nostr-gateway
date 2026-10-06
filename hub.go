@@ -119,8 +119,14 @@ func (h *hub) emit(c *conversation, a *Agent, r reduced) Envelope {
 	env := newEnvelope(a.Name, a.npub(), c.ID, r.Type, r.Payload)
 	peer := c.peerPub()
 
-	c.record(env)
+	// Recording and pushing are one critical section. They were two: the record
+	// ran before the lock, so a subscriber that registered and snapshotted in
+	// that gap saw the event in its replay buffer *and* again on the channel —
+	// one duplicated message, and `collectTurn` concatenates it into the answer
+	// verbatim. Holding h.mu across both makes the choice the comment on
+	// subscribe describes a real one.
 	h.mu.Lock()
+	c.record(env)
 	for ch := range h.subs[c.ID] {
 		select {
 		case ch <- env:
@@ -142,10 +148,13 @@ func (h *hub) emit(c *conversation, a *Agent, r reduced) Envelope {
 // replay buffer, so a client that subscribes after its first message still sees
 // the beginning of the answer.
 //
-// Registering and reading the replay buffer happen under one lock, which is the
-// only order that delivers every event exactly once: emit records into the
-// history and only then pushes to the subscribers, so an emit that lands before
-// this lock is in the snapshot and one that lands after it is on the channel.
+// Registering and reading the replay buffer happen under one lock, and emit
+// records into the history under that same lock, so the two interleave as a
+// whole: an emit that lands before this lock is in the snapshot and not yet
+// pushed, one that lands after it is on the channel and not in the snapshot.
+// Splitting either side back out reopens a window where a subscriber gets an
+// event twice (emit's record-then-lock gap) or not at all (subscribe's
+// register-then-snapshot gap), with no error anywhere.
 func (h *hub) subscribe(convID string) (<-chan Envelope, func()) {
 	ch := make(chan Envelope, 256)
 	h.mu.Lock()

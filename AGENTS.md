@@ -55,7 +55,11 @@ presence and channel posts all go to the same relays as the envelopes, and a
 relay refusing one of them is logged at `debug` with the relay that refused and
 is only a failure when no relay took it. `warnOnce` exists for the faults that
 repeat on the `buzzRefresh` tick: said once at `warn`, then `debug` per repeat,
-keyed by agent and fault.
+keyed by agent and fault. Both `warned` and `profiled` are maps shared by every
+agent's goroutine and are guarded by `nostrTransport.stateMu`; "one writer per
+key" was the old rule and it was not a rule at all, because two agents on one
+transport are two writers to one map. `TestWarnOnceIsSafeAcrossAgents` is the
+race guard.
 
 ## Wiring
 
@@ -230,7 +234,7 @@ that swallows its result makes the agent deaf with nothing in the log.
   create call out of the lock; `TestConcurrentFirstMessageCreatesOneSession`
   covers it (4 sessions vs 1).
 - **The lock order is one-way: `c.mu` may be held while `m.mu` is taken, never the
-  reverse.** `ensureSession`'s closure calls `m.index` (`hub.go:248`) while it holds
+  reverse.** `ensureSession`'s closure calls `m.index` (`hub.go:257`) while it holds
   `c.mu`, so the nesting `c.mu → m.mu` exists and is deliberate. Nothing takes
   `m.mu` and then `c.mu`: `lookup`, `get`, `getHistory` and `byOpenCodeSession` all
   return the `*conversation` and drop `m.mu` (`sessions.go:104-122`) before any
@@ -240,10 +244,22 @@ that swallows its result makes the agent deaf with nothing in the log.
   allow-listed users on one conversation id is not a group chat, and the docs say
   so. Fixing that needs a reply-routing decision, not a patch.
 - `subscribe` registers the subscriber and snapshots its history **under one
-  `h.mu` hold**. They were two separate steps, and `emit` records into the
-  conversation and then pushes under `h.mu`, so an event landing in that gap was
-  dropped for that subscriber with no error anywhere. Do not split them back out
-  to "avoid holding the lock longer".
+  `h.mu` hold**, and `emit` records into the conversation **inside that same
+  hold**, before it pushes. Record-then-push used to be two separate steps on
+  both sides, so an event landing in either gap went to the conversation but not
+  to a subscriber registering right then — dropped for that subscriber with no
+  error anywhere, and `historyDepth` was the only reason it showed up as a short
+  replay rather than a permanent hole. Do not hoist `c.record(env)` back out "to
+  avoid holding the lock longer": the record and the subscriber push are one
+  transaction or neither is.
+- The Nostr subscription's filter is built **inside** `listen`'s reconnect loop,
+  not before it. Built once, it kept its original `Since` for the life of the
+  process, so every resubscribe asked the relay for everything published since
+  startup and re-prompted each stored event as a duplicate answer. `buzzListen`
+  has always rebuilt its own filter per pass for the same reason.
+  `TestResubscribeRebuildsItsSince` is the guard; the fake relay cannot honour
+  `since`, so it asserts what decides it — the second REQ asking later than the
+  first.
 - `buzzJob` runs on the single publish `worker` goroutine that serves every
   agent, so a panic there is a process crash, not a failed message. Every
   `n.turns[...]` read in it must tolerate the entry being absent: a turn reaches
@@ -307,8 +323,13 @@ answered by nothing. And a repeated snapshot must contribute only its new tail,
 which is why `seen` is `map[string]int` and not a set — the value is how much of
 that part has been emitted. A part that does arrive as deltas instead records
 `stream:<id>`, so its final full-text snapshot is not repeated on top of them.
-`TestAnEmptyPartDoesNotConsumeTheAnswer` and `TestAGrowingPartEmitsOnlyItsNewText`
-are the guards. `buzzJob` warns when a turn ends with nothing to post, which is the
+An empty snapshot is not an emission, but whitespace is: `"\n"` is the break
+between paragraphs and the model leans on it, so the guard is `text == ""`, not
+`strings.TrimSpace(text) == ""`, and a `stream:` mark is only taken when a part
+actually emitted something.
+`TestAnEmptyPartDoesNotConsumeTheAnswer`, `TestAGrowingPartEmitsOnlyItsNewText`
+and `TestAWhitespaceOnlyDeltaIsEmitted` are the guards. `buzzJob` warns when a
+turn ends with nothing to post, which is the
 one line that turns this whole class of silence into a log entry.
 
 Other numbers that are deliberate, not arbitrary: `maxEventBytes` 32 MB per SSE
@@ -327,6 +348,17 @@ backpressure.
   response, and the ack id is the cursor: `subscribe` replays the conversation's
   history, so without cutting at the ack a continued conversation would answer
   with the previous turn. Do not replace that with a timestamp comparison.
+  It also **yields the terminal event to the caller before returning**: `error`
+  and `permission_request` end the turn, and both surfaces want to render them.
+  Returning first made the `TypeError` branches in `untilTurnEnd`'s two callers
+  dead code, which is how a failed turn came out as `200` + `finish_reason:"stop"`
+  + empty content and a pending permission came out as `200` with the permission
+  title as the model's answer. Only `completed` returns without yielding.
+  `collectTurn` maps both to a non-`""` message and `http.go` turns them into a
+  502. `TestOpenAITurnErrorIsNotACompletion` and
+  `TestOpenAIPermissionRequestFailsTheTurn` are the guards — both assert on the
+  original failure text, because the two other shapes above are what a regression
+  produces.
 - In-memory only. No database, no eviction, no persistence — a restart drops
   conversation→session state. Keep it that way unless asked.
 - Config is static JSON (`AGENTS_FILE` or inline `AGENTS`), not a CRD watcher.

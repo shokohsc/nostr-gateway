@@ -1025,3 +1025,136 @@ func TestRelayListMergesTheDeprecatedVariables(t *testing.T) {
 		t.Fatalf("unset relays gave %v, want the defaults %v", got, splitCSV(defaultRelays))
 	}
 }
+
+// untilTurnEnd used to return on TypeError *before* yielding it, so
+// collectTurn's error branch was unreachable dead code: a failed turn came
+// back as HTTP 200 with whatever partial text had been collected. The same
+// shape on the streaming face gave a clean `finish_reason: stop`.
+func TestOpenAITurnErrorIsNotACompletion(t *testing.T) {
+	f := newFakeOC(t)
+	_, srv := testHub(t, testRegistry(t, f.URL))
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		f.push("session.error", map[string]any{
+			"sessionID": "ses_1",
+			"error":     map[string]any{"message": "provider exploded"},
+		})
+	}()
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"opencode-nostr-gateway/frontend-agent","messages":[{"role":"user","content":"go"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("a failed turn answered %d with %s, want 502: an error must not look like a completion",
+			resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "provider exploded") {
+		t.Fatalf("error body %q does not carry the turn's error", body)
+	}
+}
+
+// A permission request is not answerable over this surface at all, so it has
+// to fail the request rather than park it: untilTurnEnd did not treat it as
+// terminal, so the handler sat there until the client gave up, and had it
+// ever returned it would have returned 200 with the permission title as the
+// model's answer.
+func TestOpenAIPermissionRequestFailsTheTurn(t *testing.T) {
+	f := newFakeOC(t)
+	_, srv := testHub(t, testRegistry(t, f.URL))
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		f.push("permission.asked", map[string]any{
+			"sessionID": "ses_1", "requestID": "req_9", "title": "run tests",
+		})
+		// No completion follows: a real server waits for a decision nobody on
+		// this surface can make, which is the whole point.
+	}()
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"opencode-nostr-gateway/frontend-agent","messages":[{"role":"user","content":"go"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("a pending permission answered %d with %s, want 502", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "req_9") {
+		t.Fatalf("body %q does not name the permission the client would have to resolve", body)
+	}
+}
+
+// A delta of only whitespace is content, not a placeholder: dropping it
+// removed paragraph breaks from the streamed answer. Worse, the stream mark
+// was set before the emptiness check, so the part was remembered as streamed
+// while nothing went out and every snapshot after it was suppressed — the
+// whole part's text lost, turn completes clean, channel gets no reply.
+func TestAWhitespaceOnlyDeltaIsEmitted(t *testing.T) {
+	event := func(delta, text string) opencodeEvent {
+		raw, _ := json.Marshal(map[string]any{"type": "message.part.updated", "properties": map[string]any{
+			"delta": delta,
+			"part":  map[string]any{"id": "p1", "type": "text"},
+			"text":  text,
+		}})
+		var oe opencodeEvent
+		_ = json.Unmarshal(raw, &oe)
+		return oe
+	}
+
+	seen := map[string]int{}
+	got := reduceEvent(event("\n", ""), seen)
+	if len(got) != 1 || got[0].Type != TypeMessage || got[0].Payload.Text != "\n" {
+		t.Fatalf("a whitespace-only delta produced %+v, want the break itself", got)
+	}
+	if seen["stream:p1"] == 0 {
+		t.Fatal("a delta that emitted was not marked streamed; its final snapshot would repeat it")
+	}
+
+	// An event with genuinely nothing in it still marks nothing: that mark is
+	// what used to swallow every snapshot that followed.
+	empty := map[string]int{}
+	if got := reduceEvent(event("", ""), empty); len(got) != 0 {
+		t.Fatalf("an empty part produced %+v, want nothing", got)
+	}
+	if empty["stream:p1"] != 0 {
+		t.Fatal("an empty part marked the part streamed; every later snapshot of it would be dropped")
+	}
+}
+
+// warned and profiled are two maps shared by every agent's buzzListen
+// goroutine. The old "one writer per key" rule is not a safe rule for a Go
+// map: disjoint keys in one map still race on its buckets, and the runtime
+// terminates the process on it. nostr_test.go is //go:build !race, so this
+// test lives here — it is the only one that runs under -race and touches them.
+func TestWarnOnceIsSafeAcrossAgents(t *testing.T) {
+	n := &nostrTransport{
+		warned: map[string]bool{},
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			a := &Agent{Name: fmt.Sprintf("agent-%d", i)}
+			<-start
+			for range 200 {
+				n.warnOnce(a, "no-channel", "buzz: agent is in no channel yet")
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(n.warned) != 4 {
+		t.Fatalf("warned holds %d keys, want one per agent", len(n.warned))
+	}
+}

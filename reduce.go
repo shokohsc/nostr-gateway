@@ -123,18 +123,21 @@ func reducePart(pt part, delta string, seen map[string]int) []reduced {
 			typ = TypeThinking
 		}
 		text := delta
-		if text != "" {
-			// Remember that this part streams, so a final full-text snapshot of
-			// the same part is not emitted on top of its own deltas.
-			seen["stream:"+pt.ID] = 1
-		} else {
+		if text == "" {
 			text = pt.Text
 		}
-		if strings.TrimSpace(text) == "" {
+		if text == "" {
 			// Nothing to emit and nothing to remember. OpenCode publishes a part
 			// before it has any text, and marking it seen here drops every
 			// snapshot of it that follows — the whole answer with it, so the turn
 			// completes with nothing accumulated and the channel gets no reply.
+			//
+			// The test is `text == ""`, not a whitespace trim, and it runs before
+			// the stream mark below. A delta of "\n" is content the reader is
+			// owed: trimming it dropped the break from the streamed text, and
+			// because the mark was set first it also recorded the part as
+			// streamed while emitting nothing — so every later snapshot hit the
+			// "already emitted as deltas" branch and the whole part vanished.
 			return nil
 		}
 		if delta == "" {
@@ -151,6 +154,11 @@ func reducePart(pt part, delta string, seen map[string]int) []reduced {
 			}
 			text = text[n:]
 			seen[key] = n + len(text)
+		} else {
+			// Remember that this part streams, so a final full-text snapshot of
+			// the same part is not emitted on top of its own deltas. Set on the
+			// branch that actually emits, and nowhere else.
+			seen["stream:"+pt.ID] = 1
 		}
 		return []reduced{{Type: typ, Payload: Payload{Text: text}}}
 

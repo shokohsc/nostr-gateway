@@ -241,9 +241,12 @@ func (h *hub) streamCompletion(w http.ResponseWriter, r *http.Request, a *Agent,
 			if !send(env.Payload.Text, false) {
 				return
 			}
-		case TypeError:
+		case TypeError, TypePermissionReq:
 			// The turn ended badly, and a stream has no status code left to say
-			// so: the error goes in the content, then the stream ends.
+			// so: the error goes in the content, then the stream ends. A
+			// permission request ends it too — without this case it fell
+			// through, the loop closed on the next terminal event, and the
+			// client got an empty successful completion it could not act on.
 			send(env.Payload.Text, true)
 			fmt.Fprint(w, "data: [DONE]\n\n")
 			flusher.Flush()
@@ -260,15 +263,26 @@ func (h *hub) streamCompletion(w http.ResponseWriter, r *http.Request, a *Agent,
 // render, so only the answer text is joined; a permission request is the
 // exception, and it arrives as its own error because there is no way to ask for
 // one over this surface (see the Known limits in the README).
+//
+// The failure string must be non-empty in every failure case: chatCompletions
+// decides success by `failure != ""`, so a `TypeError` carrying an empty
+// `payload.error` would otherwise be reported to the client as a clean 200.
 func collectTurn(ctx context.Context, ch <-chan Envelope, after string) (string, string) {
 	var text strings.Builder
 	for env := range untilTurnEnd(ctx, ch, after) {
 		switch env.Type {
 		case TypeMessage:
 			text.WriteString(env.Payload.Text)
-		case TypeError, TypePermissionReq:
-			text.WriteString(env.Payload.Text)
-			return text.String(), env.Payload.Error
+		case TypeError:
+			if env.Payload.Error != "" {
+				return text.String(), env.Payload.Error
+			}
+			return text.String(), env.Payload.Text
+		case TypePermissionReq:
+			// Not the title as a 200 answer: the turn is stalled waiting for a
+			// decision nobody on this surface can make, so say that instead.
+			return text.String(), "permission " + env.Payload.PermissionID +
+				" is pending: it cannot be answered over this surface"
 		}
 	}
 	return text.String(), ""
@@ -278,6 +292,12 @@ func collectTurn(ctx context.Context, ch <-chan Envelope, after string) (string,
 // including the ack, and closing on completed, error or the client going away.
 // A client that hangs up mid-turn is normal, not an error, so this is where the
 // wait ends.
+//
+// The terminal events other than `completed` are yielded *before* the channel
+// closes, never dropped on the way out. Returning first made both callers'
+// `case TypeError` branches unreachable: a failed turn came back as a 200 with
+// whatever partial text had accumulated, and a permission request — which is
+// not terminal here at all — left the request parked until the client gave up.
 func untilTurnEnd(ctx context.Context, ch <-chan Envelope, after string) <-chan Envelope {
 	out := make(chan Envelope)
 	go func() {
@@ -296,13 +316,16 @@ func untilTurnEnd(ctx context.Context, ch <-chan Envelope, after string) <-chan 
 					}
 					continue
 				}
-				if env.Type == TypeCompleted || env.Type == TypeError {
-					return
+				if env.Type == TypeCompleted {
+					return // nothing to say; the caller ends the turn here
 				}
 				select {
 				case out <- env:
 				case <-ctx.Done():
 					return
+				}
+				if env.Type == TypeError || env.Type == TypePermissionReq {
+					return // delivered; the turn is over either way
 				}
 			}
 		}

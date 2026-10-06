@@ -352,9 +352,14 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 // added to a channel in the first place.
 func (n *nostrTransport) buzzProfile(ctx context.Context, a *Agent) {
 	// One writer per agent: buzzListen is the only caller, one goroutine each.
+	// The map is shared across those goroutines, hence stateMu — see its
+	// comment: disjoint keys do not make concurrent access to one Go map safe.
+	n.stateMu.Lock()
 	if n.profiled[a.Name] {
+		n.stateMu.Unlock()
 		return
 	}
+	n.stateMu.Unlock()
 	ev := nostr.Event{
 		Kind: buzzProfileKind, CreatedAt: nostr.Now(),
 		// Buzz parses the content as JSON and rejects the event outright
@@ -375,7 +380,9 @@ func (n *nostrTransport) buzzProfile(ctx context.Context, a *Agent) {
 		n.log.Warn("buzz: agent profile not published, retrying with the next discovery", "agent", a.Name, "err", err)
 		return
 	}
+	n.stateMu.Lock()
 	n.profiled[a.Name] = true
+	n.stateMu.Unlock()
 	n.log.Info("buzz: published agent profile", "agent", a.Name, "kind", buzzProfileKind)
 }
 

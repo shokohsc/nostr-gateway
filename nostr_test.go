@@ -63,6 +63,12 @@ type fakeRelay struct {
 	// matters most in production — what the relay is asked to route — is
 	// invisible to every test here.
 	filters []nostr.Filter
+	// kickMessage closes that many kind-30078 subscriptions after their EOSE,
+	// which is the cheapest stand-in for a relay restart: the listener's range
+	// ends, it backs off, and it issues a second REQ. Whether that second REQ
+	// is built from scratch or reuses the first one's `since` is not visible
+	// any other way, and reusing it replays the whole stored history.
+	kickMessage int
 }
 
 type relayConn struct {
@@ -222,6 +228,17 @@ func (r *fakeRelay) handle(w http.ResponseWriter, req *http.Request) {
 				c.write([]any{"EVENT", subID, ev})
 			}
 			c.write([]any{"EOSE", subID})
+			if hasKind(f, messageKind) {
+				r.mu.Lock()
+				kick := r.kickMessage > 0
+				if kick {
+					r.kickMessage--
+				}
+				r.mu.Unlock()
+				if kick {
+					c.write([]any{"CLOSED", subID, "relay going away"})
+				}
+			}
 		case `"CLOSE"`:
 			// Only this subscription goes away, like a real relay: closing the
 			// whole connection here would tear down the gateway's other
@@ -1466,5 +1483,63 @@ func TestOneRelayListServesBothRoles(t *testing.T) {
 	}
 	if !relay.hasPublished(buzzPresenceKind) {
 		t.Fatal("no presence, so Buzz shows the agent offline")
+	}
+}
+
+// listen built its filter once, before the reconnect loop, so every
+// resubscribe carried the original `since` — one relay restart and the relay
+// re-sent everything published since process start, each event decrypted and
+// re-prompted into the session as a duplicate. buzzListen has always rebuilt
+// its own filter per pass; this is the guard that the envelope listener does
+// too. The fake relay cannot honour `since` (it replays its store regardless),
+// so what is asserted is the thing that decides it: a second REQ that asks
+// again from now, not from startup.
+func TestResubscribeRebuildsItsSince(t *testing.T) {
+	f := newFakeOC(t)
+	relay := newFakeRelay(t)
+	relay.store = true
+	relay.kickMessage = 1
+
+	ask := nostr.GeneratePrivateKey()
+	apk, _ := nostr.GetPublicKey(ask)
+	reg := &Registry{byName: map[string]*Agent{
+		"frontend-agent": {Name: "frontend-agent", OpenCode: f.URL, PubKey: apk,
+			sk: ask, ck: map[string][32]byte{}},
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHub(reg, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	h.nostr = nt
+	go h.run(ctx)
+	go nt.run(ctx)
+
+	messageFilters := func() []nostr.Timestamp {
+		var out []nostr.Timestamp
+		for _, f := range relay.filters {
+			if hasKind(f, messageKind) && f.Since != nil {
+				out = append(out, *f.Since)
+			}
+		}
+		return out
+	}
+	// The kick lands right after the first EOSE, then the listener backs off
+	// before asking again — at least reconnectBase, so the two timestamps are
+	// never the same second.
+	waitFor(t, "the listener resubscribed", func() bool {
+		relay.mu.Lock()
+		defer relay.mu.Unlock()
+		return len(messageFilters()) >= 2
+	})
+
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	since := messageFilters()
+	if since[1] <= since[0] {
+		t.Fatalf("the second REQ asked from %d, not later than the first's %d: the filter was "+
+			"built outside the reconnect loop, so this resubscribe replays everything since "+
+			"process start", since[1], since[0])
 	}
 }
