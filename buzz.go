@@ -109,10 +109,21 @@ func buzzChannelOf(conv string) (string, bool) {
 
 // buzzDiscover lists the channels the agent is in. NIP-29 publishes one member
 // list per channel, and the agent's own pubkey on it means the agent is a
-// member, so a single filter fetches them all. FetchMany is a one-shot REQ that
-// ends at EOSE and answers a NIP-42 challenge on the way, so a closed relay
-// works here exactly as it does for the kind-30078 subscription. The timeout is
-// the point: this is the one call in the gateway whose failure mode is silence.
+// member. FetchMany is a one-shot REQ that ends at EOSE and answers a NIP-42
+// challenge on the way, so a closed relay works here exactly as it does for the
+// kind-30078 subscription. The timeout is the point: this is the one call in
+// the gateway whose failure mode is silence.
+//
+// The membership test happens here, on the result, and is deliberately not a
+// `#p` filter. That would be the gateway *deciding* membership pushed into a
+// relay-side filter, which is the rule the rest of the gateway keeps for
+// `authors` and every other tag: the relay drops what does not match before
+// delivering, so a refusal and a broken relay come back identical. Worse, it
+// makes the two answers below indistinguishable — an agent in no channel has no
+// member list naming it, so a `#p` filter returns nothing and the log claims the
+// relay is withholding 39002, sending the operator to fix the wrong thing while
+// the actual fix is `buzz-admin add-member`. Query kinds alone, then read the
+// `p` tags off the rosters that came back.
 //
 // It also returns how many member lists the relay served, and that is not
 // cosmetic. "No channel" and "no member lists at all" have opposite fixes — add
@@ -124,7 +135,7 @@ func (n *nostrTransport) buzzDiscover(ctx context.Context, a *Agent) (buzzChanne
 	ctx, cancel := context.WithTimeout(ctx, buzzFetchTimeout)
 	defer cancel()
 	chans, rosters := buzzChannels{}, 0
-	filter := nostr.Filter{Kinds: []int{buzzMemberKind}, Tags: nostr.TagMap{"p": []string{a.PubKey}}}
+	filter := nostr.Filter{Kinds: []int{buzzMemberKind}}
 	for ie := range n.buzzPools[a.Name].FetchMany(ctx, n.relays, filter) {
 		if ie.Event == nil {
 			continue // EOSE, or a subscription the relay closed
@@ -135,8 +146,15 @@ func (n *nostrTransport) buzzDiscover(ctx context.Context, a *Agent) (buzzChanne
 			continue
 		}
 		members := 0
-		for range ie.Event.Tags.FindAll("p") {
+		isMember := false
+		for tag := range ie.Event.Tags.FindAll("p") {
 			members++
+			if len(tag) > 1 && tag[1] == a.PubKey {
+				isMember = true
+			}
+		}
+		if !isMember {
+			continue
 		}
 		chans[channel] = members
 	}

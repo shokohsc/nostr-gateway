@@ -191,9 +191,13 @@ export RELAYS='wss://nos.lol,ws://buzz.example.internal:3000'
 ```
 
 - A relay only hands channel-scoped events to a subscription that names the
-  channel, so the agent's channels are discovered first, from the NIP-29 member
-  lists (kind `39002`) the agent's own pubkey appears in. Membership is re-read
-  every minute, so a channel the agent was added to later needs no restart.
+  channel, so the agent's channels are discovered first: the gateway asks for
+  every member list (kind `39002`) and reads the agent's own pubkey off the
+  ones that come back. The query carries no `#p` filter — membership is a
+  decision, and a decision in a filter is a refusal the relay makes before the
+  gateway can log it, which here would be an agent in no channel blaming the
+  relay for withholding its roster. Membership is re-read every minute, so a
+  channel the agent was added to later needs no restart.
 - That discovered list **is** the `#h` filter on the kind-9 subscription, because
   omitting it does not widen what the agent hears, it ends it: the relay delivers
   a channel message only to subscriptions naming that channel, so a REQ with kinds

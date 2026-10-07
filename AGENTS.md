@@ -208,6 +208,16 @@ that swallows its result makes the agent deaf with nothing in the log.
   guards, and between them they cover both halves — the first asserts one scoped
   and one channel-less kind-9 REQ, with the scoped one naming exactly the
   discovered channel, so neither deafness can come back.
+  - **The kind-39002 discovery query carries no tag at all, and must keep not
+    carrying one.** It used to send `#p` for the agent, which is membership —
+    the gateway *deciding* — pushed into a relay filter, and it destroyed the
+    distinction the `rosters` return value exists for: a `#p` query can only
+    return a roster that names the agent, so the `len(ids)==0` → "agent is in no
+    channel yet" branch was unreachable and an agent in no channel was told to
+    fix a relay instead of to `buzz-admin add-member`. A relay that does not
+    route 39002 on `p` returned nothing every time, with the same clean log.
+    Membership is read off the rosters that come back.
+    `TestBuzzDiscoveryAsksForRostersNotMembership` is the guard.
 - **Keys are normalised to hex exactly once**, in `loadRegistry`. A bech32 pubkey
   reaching go-nostr produces a `p` tag filter that never matches a real relay —
   the agent goes silently deaf, with no error anywhere. `TestNostrRoutesByPTag`

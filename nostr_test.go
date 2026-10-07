@@ -1543,3 +1543,77 @@ func TestResubscribeRebuildsItsSince(t *testing.T) {
 			"process start", since[1], since[0])
 	}
 }
+
+// The kind-39002 query used to carry `#p=<agent>`, which is membership — a
+// gateway decision — pushed into a relay-side filter, the same rule the rest of
+// the gateway keeps for `authors` and every other tag: the relay drops what does
+// not match before delivering, so a refusal and a broken relay come back
+// identical. The concrete damage was that the two answers became
+// indistinguishable. An agent in no channel has no member list naming it, so a
+// `#p` filter returned nothing and the log blamed the relay for withholding
+// 39002 — "check the relay serves it to this pubkey, and that the pubkey is a
+// relay member" — while the fix the operator needed was `buzz-admin
+// add-member`. The roster that branch exists to report was never reachable at
+// all, because a `#p` query can only return a roster that names the agent.
+//
+// Membership is read off the rosters instead. It also keeps working on a relay
+// that does not route 39002 on `p`.
+func TestBuzzDiscoveryAsksForRostersNotMembership(t *testing.T) {
+	f := newFakeOC(t)
+	relay := newFakeRelay(t)
+	relay.store = true
+
+	usk := nostr.GeneratePrivateKey()
+	ask := nostr.GeneratePrivateKey()
+	apk, _ := nostr.GetPublicKey(ask)
+	other, _ := nostr.GetPublicKey(nostr.GeneratePrivateKey())
+	agent := &Agent{Name: "frontend-agent", OpenCode: f.URL, PubKey: apk, sk: ask,
+		ck: map[string][32]byte{}}
+	reg := &Registry{byName: map[string]*Agent{agent.Name: agent}}
+
+	// The relay answers discovery with a member list, and the agent is not on it.
+	relay.inject(buzzMembers(t, usk, other, "channel-others", 3))
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHub(reg, log)
+	nt := newNostrTransport(ctx, []string{relay.url()}, reg, h, log)
+	h.nostr = nt
+	go h.run(ctx)
+	go nt.run(ctx)
+
+	waitFor(t, "the member-list REQ", func() bool {
+		relay.mu.Lock()
+		defer relay.mu.Unlock()
+		return slices.ContainsFunc(relay.filters, func(f nostr.Filter) bool {
+			return hasKind(f, buzzMemberKind)
+		})
+	})
+	relay.mu.Lock()
+	for _, got := range relay.filters {
+		if !hasKind(got, buzzMemberKind) {
+			continue
+		}
+		if len(got.Tags) != 0 || len(got.Authors) != 0 {
+			t.Errorf("discovery asked the relay to adjudicate membership: %#v; the relay drops "+
+				"what does not match before delivering, so the refusal is unloggable", got)
+		}
+	}
+	relay.mu.Unlock()
+
+	// A roster the agent is not on is a real answer, and has to be reported as
+	// the wait for a join it is — not as a relay that serves nothing.
+	waitFor(t, "the no-channel report", func() bool {
+		return strings.Contains(buf.String(), "buzz: agent is in no channel yet")
+	})
+	for _, notWanted := range []string{
+		"buzz: discovery came back with no member lists",
+		"buzz: relay serves no member lists for this agent",
+	} {
+		if strings.Contains(buf.String(), notWanted) {
+			t.Errorf("a served member list was reported as %q:\n%s", notWanted, buf.String())
+		}
+	}
+}
