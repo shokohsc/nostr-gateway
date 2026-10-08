@@ -38,6 +38,11 @@ func main() {
 	if token == "" {
 		log.Warn("GATEWAY_TOKEN is unset: the HTTP API is open to anything that can reach it")
 	}
+	if os.Getenv("OPENCODE_USER") == "" {
+		log.Warn("OPENCODE_USER is unset: calls to OpenCode carry no credentials, so a server with " +
+			"OPENCODE_SERVER_PASSWORD rejects every one of them. Its username is OPENCODE_SERVER_USERNAME, " +
+			"which is \"opencode\" unless you set it otherwise")
+	}
 	if err := h.serveHTTP(ctx, envOr("GATEWAY_ADDR", ":8080"), token); err != nil {
 		log.Error("http", "err", err)
 		os.Exit(1)

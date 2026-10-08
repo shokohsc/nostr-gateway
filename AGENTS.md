@@ -283,6 +283,21 @@ that swallows its result makes the agent deaf with nothing in the log.
 
 ## OpenCode compatibility
 
+Server auth is a pair of names that do not match. OpenCode reads
+`OPENCODE_SERVER_USERNAME` (default `opencode`) and `OPENCODE_SERVER_PASSWORD`;
+the gateway reads `OPENCODE_USER` / `OPENCODE_PASSWORD` and sends them as HTTP
+Basic on every call, or sends nothing at all when they are unset. A server with
+a password answers an unauthenticated request with **401**, an empty body and
+`WWW-Authenticate: Basic realm="Secure Area"` — never 403, on loopback or over
+the network, with any `Origin`. Verified against opencode 1.18.34. So a 403 on
+`/global/event` is not OpenCode refusing the gateway; it is something in front
+of it, and `events` keeps the response body so the log can name which — it used
+to build its own request instead of going through `do()` and report nothing but
+the status line, which made a credential failure, a misconfigured proxy and a
+dead server look identical. `main` warns at startup when `OPENCODE_USER` is
+unset, the same treatment `GATEWAY_TOKEN` gets.
+`TestOpenCodeStreamErrorCarriesTheBody` is the guard.
+
 Two API generations are live in the wild and both are handled on purpose:
 
 - `permission.updated` + `permissionID` + `response` →

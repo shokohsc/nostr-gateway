@@ -143,8 +143,38 @@ the same.
 | `BUZZ_RELAYS` | — | **Deprecated**, merged into `RELAYS`. Same |
 | `GATEWAY_ADDR` | `:8080` | HTTP listen address |
 | `GATEWAY_TOKEN` | unset | Bearer token for the HTTP API. **Unset means the HTTP API is open to anything that can reach it**, so the gateway logs a warning at startup. An empty `allow` list has the same consequence on the Nostr path |
-| `OPENCODE_USER` / `OPENCODE_PASSWORD` | unset | Basic auth for OpenCode servers that require it |
+| `OPENCODE_USER` / `OPENCODE_PASSWORD` | unset | Basic auth for OpenCode servers that require it — see below, the pair is not optional once the agent's server has a password |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+
+### Talking to OpenCode
+
+OpenCode's server takes its own credentials, and they are a different pair of
+names from the gateway's. On the agent's side:
+
+```bash
+export OPENCODE_SERVER_USERNAME=opencode   # the default; only worth setting to change it
+export OPENCODE_SERVER_PASSWORD=$(openssl rand -hex 32)
+```
+
+On the gateway's side, the same values under the gateway's names:
+
+```bash
+export OPENCODE_USER=opencode
+export OPENCODE_PASSWORD=$OPENCODE_SERVER_PASSWORD
+```
+
+Without the second pair the gateway sends no credentials at all, and an agent
+whose OpenCode has a password rejects every call — not just the event stream,
+the session creation and the prompt too. That is a startup `warn` from the
+gateway, and an OpenCode that prints `OPENCODE_SERVER_PASSWORD is not set;
+server is unsecured.` on the other side.
+
+The status code is worth knowing when it goes wrong: OpenCode answers
+unauthenticated or wrongly-authenticated requests with **401** and
+`WWW-Authenticate: Basic realm="Secure Area"`, never 403. So a 403 on
+`/global/event` is not OpenCode refusing you — it is something between the
+gateway and OpenCode, an ingress or an auth proxy. The gateway prints the
+response body and the status on a failed stream open for exactly that reason.
 
 ### One relay list
 
@@ -425,7 +455,8 @@ its break), replay for late SSE subscribers, the OpenAI surface
 (`/v1/models`, a non-streaming completion, a streamed one ending in `[DONE]`, an
 unknown model rejected, a continued conversation not carrying the previous
 turn's answer, a failed turn answering `502` instead of an empty `200`, and a
-pending permission answering `502` instead of posing as the answer), protocol
+pending permission answering `502` instead of posing as the answer), a failed
+stream open naming the response body rather than only the status, protocol
 version and body-size rejection, an oversized event surviving the stream, the
 allow list
 on the Nostr path and the absence of *any* relay-side filter that could swallow
@@ -436,7 +467,9 @@ loading and key normalisation from env, a Buzz mention and a Buzz DM reaching
 OpenCode (and group chatter not reaching it) with one session per channel, a
 streamed answer assembled into one kind-9 channel message with nothing published
 to `RELAYS`, the agent not answering its own channel replies, a Buzz
-discovery recovering from a refused NIP-42 handshake, a Buzz discovery on a relay
+discovery recovering from a refused NIP-42 handshake, a Buzz discovery asking
+for member lists rather than asking the relay who is a member (so "the agent is
+in no channel yet" is reachable), a Buzz discovery on a relay
 that is also a `RELAYS` entry, the agent profile published before the agent
 is in any channel, a Buzz turn that reaches `completed` with nothing accumulated
 without taking the process down, a resubscribe rebuilding its `since` filter

@@ -1158,3 +1158,42 @@ func TestWarnOnceIsSafeAcrossAgents(t *testing.T) {
 		t.Fatalf("warned holds %d keys, want one per agent", len(n.warned))
 	}
 }
+
+// The event stream built its own request instead of going through do(), and its
+// error dropped the response body. Every other OpenCode call names what came
+// back; the one call that fails most often at startup — the only one that can
+// 401, 403 or 502 on its own — reported nothing but the status line, so a
+// credential problem, a misconfigured proxy and a broken server all looked
+// identical. Real shapes, captured from opencode 1.18.34: a server with
+// OPENCODE_SERVER_PASSWORD set answers an unauthenticated /global/event with
+// 401, an empty body and `WWW-Authenticate: Basic realm="Secure Area"`, and it
+// never answers 403 at all — which is what makes the body worth printing.
+func TestOpenCodeStreamErrorCarriesTheBody(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+		body string
+		want string
+	}{
+		{"proxy-style 403", http.StatusForbidden, "no route matched by the ingress", "no route matched by the ingress"},
+		{"server-style 401", http.StatusUnauthorized, "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.code)
+				io.WriteString(w, tc.body)
+			}))
+			defer ts.Close()
+			_, _, err := newOpencodeClient(ts.URL, "", "").events(context.Background())
+			if err == nil {
+				t.Fatal("a non-200 stream open was treated as success")
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("%d ", tc.code)) {
+				t.Errorf("error %q lost the status", err)
+			}
+			if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q dropped the response body", err)
+			}
+		})
+	}
+}

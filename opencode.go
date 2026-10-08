@@ -219,8 +219,14 @@ func (c *opencodeClient) events(ctx context.Context) (<-chan opencodeEvent, <-ch
 		return nil, nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		// Keep the body, exactly as do() does. A 401 from OpenCode is an empty
+		// body plus `WWW-Authenticate`, and a 403 from whatever is in front of
+		// it is usually a proxy's HTML — either way the status alone sends the
+		// operator to the wrong component.
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
-		return nil, nil, fmt.Errorf("GET /global/event: %s", resp.Status)
+		return nil, nil, fmt.Errorf("GET /global/event: %s: %s", resp.Status,
+			strings.TrimSpace(string(b)))
 	}
 
 	out := make(chan opencodeEvent)
