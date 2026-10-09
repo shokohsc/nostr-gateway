@@ -757,7 +757,9 @@ func TestNostrAuthenticatesPerAgentOnAClosedRelay(t *testing.T) {
 // The kind-9 listener sends both halves, because neither one covers the other: a
 // scoped REQ hears what the relay routed to a channel and a channel-less one
 // hears what it could not route, and the relay keeps the two subscriptions in
-// separate scopes so nothing arrives twice.
+// separate scopes so nothing arrives twice. The scoped half is one REQ PER
+// channel: the relay reads a REQ naming two channels as global scope, so a
+// single filter listing them all is deaf to every one of them.
 // ponytail: a relay filtering a large public channel set would make the wide
 // fan-out expensive; a periodic self-REQ to prove delivery buys it back.
 func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
@@ -784,13 +786,15 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 	go h.run(ctx)
 	go nt.run(ctx)
 
-	// One channel the agent is in, so the Buzz listener gets past discovery and
-	// issues its kind-9 REQ.
+	// Two channels the agent is in, because the relay reads a single-filter
+	// subscription naming more than one channel as global scope and then delivers
+	// no channel message at all — so one channel would not exercise the bug.
 	relay.store = true
 	relay.inject(buzzMembers(t, nostr.GeneratePrivateKey(), reg.byName["frontend-agent"].PubKey, "chan-1", 2))
+	relay.inject(buzzMembers(t, nostr.GeneratePrivateKey(), reg.byName["frontend-agent"].PubKey, "chan-2", 2))
 
-	// One subscription per role, and two for the Buzz listener: the kind-30078
-	// envelope, the channel-scoped kind 9 and its channel-less companion.
+	// One subscription per role, and one channel-scoped kind-9 REQ per channel
+	// plus its channel-less companion for the Buzz listener.
 	waitFor(t, "both transports subscribed", func() bool {
 		relay.mu.Lock()
 		defer relay.mu.Unlock()
@@ -802,7 +806,7 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 				}
 			}
 		}
-		return len(relay.filters) >= 3 && chat >= 2
+		return len(relay.filters) >= 4 && chat >= 3
 	})
 
 	relay.mu.Lock()
@@ -827,11 +831,14 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 				"by the relay and the gateway never logs the refusal", i, f.Authors)
 		}
 		if hasKind(f, buzzChatKind) {
-			// Exactly two, and they are not interchangeable: the scoped one can
-			// hear only what the relay routed to a channel, the unrouted one only
-			// what it could not route. Between them every kind 9 the relay holds
-			// is either delivered or refused in buzzReceive, which logs it.
-			switch len(f.Tags["h"]) {
+			// One channel-scoped REQ per discovered channel, plus one channel-less
+			// one, and they are not interchangeable: a scoped REQ can hear only
+			// what the relay routed to its one channel, the unrouted one only what
+			// it could not route. Between them every kind 9 the relay holds is
+			// either delivered or refused in buzzReceive, which logs it. A REQ
+			// naming two channels in one filter is the bug this guards: the relay
+			// falls back to global scope and hears neither.
+			switch h := f.Tags["h"]; len(h) {
 			case 0:
 				if len(f.Tags) != 0 {
 					t.Errorf("REQ %d asks for kind 9 with no #h but with tags %v: a relay "+
@@ -839,11 +846,15 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 						"the events it could not route to a channel", i, f.Tags)
 				}
 				unrouted++
-			default:
-				if !slices.Equal(f.Tags["h"], []string{"chan-1"}) {
-					t.Errorf("REQ %d asks for channels %v, want the discovered [chan-1]", i, f.Tags["h"])
+			case 1:
+				if h[0] != "chan-1" && h[0] != "chan-2" {
+					t.Errorf("REQ %d asks for channel %q, want one of the discovered channels", i, h[0])
 				}
 				scoped++
+			default:
+				t.Errorf("REQ %d asks for %d channels in one filter %v: the relay reads more "+
+					"than one channel as global scope and then delivers no channel message at all",
+					i, len(h), h)
 			}
 		}
 		for tag, vals := range f.Tags {
@@ -861,9 +872,10 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 				"before delivery, so a wrong tag name is silence, not a message", i, tag, vals)
 		}
 	}
-	if scoped != 1 || unrouted != 1 {
-		t.Errorf("kind-9 REQs: %d scoped, %d unrouted, want one of each — a message the "+
-			"relay could not route to a channel reaches the gateway on one or neither", scoped, unrouted)
+	if scoped != 2 || unrouted != 1 {
+		t.Errorf("kind-9 REQs: %d scoped, %d unrouted, want one scoped per discovered channel "+
+			"plus one unrouted — a REQ naming more than one channel is global scope and reaches "+
+			"neither a routed nor an unrouted message", scoped, unrouted)
 	}
 }
 
@@ -872,7 +884,9 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 // receives only the events naming one of them, and a subscription naming no
 // channel receives only the events naming none (buzz-relay keeps a
 // channel-scoped subscription and a global one in separate scopes, and its
-// channel id comes from the `h` tag alone). Handing every stored event to every
+// channel id comes from the `h` tag alone). It also falls back to global scope
+// as soon as a filter names more than one channel, which is why every scoped
+// kind-9 REQ has to name exactly one. Handing every stored event to every
 // subscriber makes the two subscriptions indistinguishable, so a REQ the relay
 // would answer with nothing looks here like one it answers with everything —
 // which is how a `#h`-only listener passed every test in this file while a
@@ -883,10 +897,16 @@ func TestGatewayNeverAsksTheRelayToFilter(t *testing.T) {
 // fake stores the sub ids, not the filters.
 func relayRoutes(f nostr.Filter, ev *nostr.Event) bool {
 	h := f.Tags["h"]
-	if len(h) == 0 {
+	// Channel-scoped only when exactly one channel is named, like the real
+	// relay's extract_channel_id_from_filters: no `#h` is global, and so is two
+	// or more distinct channels — it cannot index the subscription under one
+	// channel, so it falls back to global scope, which never sees a
+	// channel-routed event. A listener that packs every channel into one filter
+	// is therefore deaf exactly here, which is what this model has to reproduce.
+	if len(h) != 1 {
 		return tagValue(ev.Tags, "h") == ""
 	}
-	return slices.Contains(h, tagValue(ev.Tags, "h"))
+	return tagValue(ev.Tags, "h") == h[0]
 }
 
 func hasKind(f nostr.Filter, kind int) bool {
