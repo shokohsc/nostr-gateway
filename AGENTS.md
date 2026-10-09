@@ -16,7 +16,7 @@ go build -o /tmp/gateway .                     # build outside the tree, do not 
 ```
 
 `go.mod`'s `go` directive is the single source of truth for the Go version: the
-Dockerfile tag and CI's `go-version-file` both read it. It is `1.27.1` and it has
+Dockerfile tag and CI's `go-version-file` both read it. It is `1.27.2` and it has
 to stay at or above the patch release that fixes the current stdlib CVEs — the
 CI `govulncheck` step exists to catch a *lowered* directive, because that is how
 the gateway ends up running an unpatched `net/http`, `crypto/tls` and `crypto/x509`

@@ -37,8 +37,12 @@ jobs:
       # The only check that sees unused code. `go vet` does not, and U1000 is
       # what keeps a 4000-line package from accreting dead helpers.
       # Pinned, not @latest: a new release must not be able to break the build.
+      # It builds from tools/ because staticcheck 2026.2.1 predates go1.27.2's
+      # export-data format and needs tools/go.mod's x/tools replace to read it.
       - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@2026.2.1 ./...
+        run: |
+          (cd tools && go build -o "$RUNNER_TEMP/staticcheck" honnef.co/go/tools/cmd/staticcheck)
+          "$RUNNER_TEMP/staticcheck" ./...
 
       # `go get -u` adds go.sum lines it does not prune and leaves indirect
       # requirements behind, so the drift is real rather than theoretical.
