@@ -167,8 +167,9 @@ that swallows its result makes the agent deaf with nothing in the log.
   gateway-side check is the real boundary, so keep the filter wide and take the
   fan-out; a relay-side filter is only safe paired with a periodic self-REQ to
   prove delivery. Note that the fake relay enforces only the `#h` scope
-  (`relayRoutes`): it can catch a filter that was never sent, and a scope the
-  relay would route differently, but not a tag the relay drops.
+  (`relayRoutes`, including the relay's fallback to global when a filter names
+  more than one channel): it can catch a filter that was never sent, and a scope
+  the relay would route differently, but not a tag the relay drops.
 - **The rule is: a filter may address, never adjudicate. `authors` is out; the two
   tags the relays themselves route on stay.** A relay applies `authors` and every
   `#tag` before it delivers, so anything the gateway *decides* with in a filter is
@@ -178,36 +179,45 @@ that swallows its result makes the agent deaf with nothing in the log.
   - `#p` on the kind-30078 listener, enforced twice (the REQ and go-nostr's
     client-side `Filter.Matches`, which does run — verified, do not re-derive this
     by grepping for `Matches` outside `filter.go`).
-  - `#h` on the kind-9 listener, listing every channel `buzzDiscover` found. Buzz's
-    relay hands a channel message only to the subscriptions that **name** that
-    channel, so a REQ with kinds alone receives none of them. `buzzListen` used to
-    send `h` and it was removed as "a guess at Buzz's tag convention that
-    buzzDiscover contradicts" — and that removal made an agent deaf in every
-    channel it was a member of, with the cleanest log in the system: the relay
-    reported the message ingested, the gateway logged nothing, and no amount of
-    debugging the *processing* could have found it because nothing was processed.
-    `h` is what NIP-29 puts on a chat message and what `buzzPost` publishes, so it
-    is the name the relay routes on. `buzzChannelTag` still accepts `h` or `d` and
-    `buzzReceive` still does the membership check.
-  - **The kind-9 listener sends two REQs, and must keep sending both.** `#h`
-    covers what the relay routed to a channel; a second REQ naming **no** channel
-    covers what it could not route — a kind 9 with no `h` tag, or one whose `h` is
-    not a uuid, is stored with `channel_id = None` and the relay only ever hands
-    those to a subscription that names no channel. That is not a relay that routes
-    under `d` (such a relay routes those messages under `d` and delivers them to
+  - `#h` on the kind-9 listener, **one channel per REQ and one REQ per channel**
+    `buzzDiscover` found. Buzz's relay hands a channel message only to the
+    subscriptions that **name** that channel, so a REQ with kinds alone receives
+    none of them. `buzzListen` used to send `h` and it was removed as "a guess at
+    Buzz's tag convention that buzzDiscover contradicts" — and that removal made an
+    agent deaf in every channel it was a member of, with the cleanest log in the
+    system: the relay reported the message ingested, the gateway logged nothing,
+    and no amount of debugging the *processing* could have found it because nothing
+    was processed. It is *one channel per REQ*, never one filter listing every
+    channel: `extract_channel_id_from_filters` returns `None` (global scope) as
+    soon as two distinct channel uuids appear — across the filters, not just
+    within one — and a global subscription is never handed a channel-routed event,
+    so a single REQ naming all the agent's channels is deaf to every one of them
+    and only an agent in exactly one channel ever works. `h` is what NIP-29 puts
+    on a chat message and what `buzzPost` publishes, so it is the name the relay
+    routes on. `buzzChannelTag` still accepts `h` or `d` and `buzzReceive` still
+    does the membership check.
+  - **The kind-9 listener sends one scoped REQ per channel plus a channel-less
+    REQ, and must keep sending both kinds.** Each scoped REQ's `#h` covers what
+    the relay routed to that one channel; the REQ naming **no** channel covers
+    what it could not route — a kind 9 with no `h` tag, or one whose `h` is not a
+    uuid, is stored with `channel_id = None` and the relay only ever hands those
+    to a subscription that names no channel. That is not a relay that routes under
+    `d` (such a relay routes those messages under `d` and delivers them to
     nothing, which no gateway filter can fix); it is a message whose channel the
     relay never learned, and the agent was deaf to it with a clean log on both
     sides. `buzzReceive` then reads the channel off `h` or `d` and refuses
-    anything it is not in, which logs. Two REQs, **never one REQ with two
-    filters**: `extract_channel_ids_from_filters` returns `None` as soon as one
-    filter has no `#h`, which widens the whole subscription to global scope and
-    ends delivery of the channel messages the scoped one can hear. The pair is
-    disjoint on a relay that keeps the two scopes apart, so nothing arrives
+    anything it is not in, which logs. The channel-less REQ is **never folded into
+    a scoped one**: `extract_channel_id_from_filters` returns `None` as soon as
+    one filter has no `#h`, which widens the whole subscription to global scope
+    and ends delivery of the channel messages the scoped REQs can hear. The two
+    scopes are disjoint on a relay that keeps them apart, so nothing arrives
     twice.
   `TestGatewayNeverAsksTheRelayToFilter` and `TestNostrRoutesByPTag` are the
-  guards, and between them they cover both halves — the first asserts one scoped
-  and one channel-less kind-9 REQ, with the scoped one naming exactly the
-  discovered channel, so neither deafness can come back.
+  guards, and between them they cover every half — the first asserts one
+  channel-scoped kind-9 REQ *per discovered channel* (never one filter naming
+  two, which the relay reads as global) plus one channel-less REQ, so no deafness
+  can come back. `relayRoutes`, the fake relay's only narrowing, models the
+  multi-channel fallback to global scope for exactly that reason.
   - **The kind-39002 discovery query carries no tag at all, and must keep not
     carrying one.** It used to send `#p` for the agent, which is membership —
     the gateway *deciding* — pushed into a relay filter, and it destroyed the
@@ -396,8 +406,10 @@ backpressure.
   anything from anyone; the one filter it does enforce is the `#h` scope
   (`relayRoutes`), because a relay keeps a channel-scoped subscription and a
   global one apart and a fake that cannot tell them apart cannot catch a listener
-  that hears nothing. Its live broadcast is still unconditional, so publish before
-  starting the gateway.
+  that hears nothing. `relayRoutes` also models the relay's fallback to global
+  scope when a filter names more than one channel, so a listener that packs every
+  channel into one REQ fails here instead of shipping deaf. Its live broadcast is
+  still unconditional, so publish before starting the gateway.
 - The fake relay's `dial` — the client end a test opens to stand in for a
   user's other device — must not register itself in `conns`. The `httptest`
   handler behind that same websocket has already put the *server* end there, so

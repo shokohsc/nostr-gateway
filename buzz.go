@@ -242,64 +242,58 @@ func (n *nostrTransport) buzzListen(ctx context.Context, a *Agent) {
 			n.log.Info("buzz channels", "agent", a.Name, "channels", joined)
 		}
 
-		// Two REQs, because the relay's routing question and the gateway's are
-		// not the same one, and the relay only answers the first.
-		reqs := []nostr.Filter{
-			{
+		// One scoped REQ per channel, plus one channel-less REQ. The relay reads
+		// a subscription as channel-scoped only when the REQ names exactly one
+		// channel: its channel-id extraction returns "global" the moment two
+		// distinct channel uuids appear — across the filters, not just inside one
+		// — or any filter names none. A global subscription is never handed a
+		// channel-routed event, so one REQ naming every channel (or one REQ
+		// carrying one filter per channel) is silently global: the relay logs the
+		// message ingested, the gateway logs nothing because nothing arrived to
+		// be refused, and the agent is deaf in every channel for as long as it is
+		// a member of more than one. The only filter shape the relay reads as
+		// scoped is one REQ per channel, each naming that channel alone.
+		//
+		// `h` is the name NIP-29 gives a channel on a kind-9 chat message and
+		// what buzzPost writes, so a message this relay routes carries it. It is
+		// addressing, not narrowing: the relay delivers on it, so omitting it
+		// does not widen delivery, it ends it.
+		//
+		// What still never goes in a filter: `authors`, and any tag the gateway
+		// would otherwise use to decide something. allow, membership and the
+		// mention are all decided in buzzReceive, where a refusal can be logged.
+		// See AGENTS.md, and the same rule on nostr.listen.
+		reqs := make([]nostr.Filter, 0, len(ids)+1)
+		for _, id := range ids {
+			reqs = append(reqs, nostr.Filter{
 				Kinds: []int{buzzChatKind},
-				// The channels the agent is a member of, and nothing else: see the
-				// `#h` note below.
-				Tags: nostr.TagMap{"h": ids},
-				// This is addressing, not narrowing, and the difference is the whole
-				// bug it fixes. Buzz's relay fans a channel message out per
-				// subscription and hands it to the subscriptions that *name* that
-				// channel, so a kind-9 REQ with only `kinds` receives nothing at all
-				// — not the wrong channels, none: the agent is deaf in every channel
-				// while the relay logs the message as ingested and the gateway logs
-				// nothing, because nothing arrived to be refused. This is why
-				// discovery runs first (ids is what it returned) and why removing
-				// this tag "because it is only a guess" was the wrong call.
-				//
-				// `h` is the name NIP-29 gives a channel on a kind-9 chat message,
-				// and it is what buzzPost writes, so a message this relay routes
-				// carries it. What it cannot hear is the second REQ's: see below.
-				//
-				// What still never goes in a filter: `authors`, and any tag the
-				// gateway would otherwise use to decide something. allow, membership
-				// and the mention are all decided in buzzReceive, where a refusal can
-				// be logged. See AGENTS.md, and the same rule on nostr.listen.
-				// ponytail: one REQ per refresh covering every channel the agent is
-				// in; per-channel REQs buy nothing, because the answer is filtered
-				// by channel anyway.
+				Tags:  nostr.TagMap{"h": []string{id}},
 				// The same 5s slack as the kind-30078 subscription: a longer Since
 				// would replay channel history into brand-new OpenCode sessions.
 				Since: ptr(nostr.Now() - 5),
-			},
-			{
-				// A kind 9 the relay could not route to a channel: no `h` tag at
-				// all, or one it cannot read as a channel uuid (its
-				// `extract_channel_id` is the `h` tag, and nothing else). The
-				// relay stores such an event with no channel, and hands it to the
-				// subscriptions that name no channel — which is what a filter
-				// without `#h` is, so this REQ is the only one that can hear it.
-				// The `#h` REQ above cannot, by construction, and that is the
-				// whole bug: the relay logs the message ingested, the gateway
-				// logs that it asked for channel messages every minute, and
-				// nothing decides anything, so the case is invisible from both
-				// ends. buzzReceive decides which channel it belongs to and logs
-				// the ones it refuses.
-				//
-				// Two REQs and not one REQ carrying both filters, because a relay
-				// that finds a filter without `#h` widens the whole subscription
-				// to global scope (`extract_channel_ids_from_filters` returns
-				// None), and then the channel messages only the first REQ can
-				// hear stop arriving. The pair is disjoint: the relay keeps a
-				// channel-scoped subscription and a global one apart, so no
-				// message arrives twice.
-				Kinds: []int{buzzChatKind},
-				Since: ptr(nostr.Now() - 5),
-			},
+			})
 		}
+		reqs = append(reqs, nostr.Filter{
+			// A kind 9 the relay could not route to a channel: no `h` tag at all,
+			// or one it cannot read as a channel uuid (its `extract_channel_id` is
+			// the `h` tag, and nothing else). The relay stores such an event with
+			// no channel and hands it to the subscriptions that name no channel —
+			// which is what a filter without `#h` is, so this REQ is the only one
+			// that can hear it. The scoped REQs above cannot, by construction, and
+			// that is the whole bug: the relay logs the message ingested, the
+			// gateway logs that it asked for channel messages every minute, and
+			// nothing decides anything, so the case is invisible from both ends.
+			// buzzReceive decides which channel it belongs to and logs the ones it
+			// refuses.
+			//
+			// It must stay its own REQ: a relay that finds a filter without `#h`
+			// in the same subscription widens the whole subscription to global
+			// scope, and then the channel messages only the scoped REQs can hear
+			// stop arriving. The two scopes are disjoint on a relay that keeps
+			// them apart, so nothing arrives twice.
+			Kinds: []int{buzzChatKind},
+			Since: ptr(nostr.Now() - 5),
+		})
 		// The REQs that carry these filters go out on every refresh, but a
 		// refresh that changes nothing logs nothing, so a silent gateway is
 		// indistinguishable from a healthy one. Log what it last asked for,
